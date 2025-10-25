@@ -1,0 +1,120 @@
+name,width_m,depth_m,height_m,prefer,category,description
+# BEDROOM FURNITURE
+King Bed,2.03,2.03,0.6,wall,bedroom,King size bed (2.03m x 2.03m)
+Queen Bed,1.6,2.03,0.6,wall,bedroom,Queen size bed (1.6m x 2.03m)
+Double Bed,1.4,2.0,0.6,wall,bedroom,Double bed (1.4m x 2.0m)
+Single Bed,0.9,2.0,0.6,wall,bedroom,Single bed (0.9m x 2.0m)
+Bunk Bed,0.9,2.0,1.8,wall,bedroom,Bunk bed with ladder
+Twin Bed,0.9,1.9,0.6,wall,bedroom,Twin size bed (0.9m x 1.9m)
+
+# SEATING FURNITURE
+3-Seat Sofa,2.1,0.9,0.8,center,living,3-seater sofa (2.1m x 0.9m)
+2-Seat Sofa,1.6,0.9,0.8,center,living,2-seater sofa (1.6m x 0.9m)
+Loveseat,1.4,0.8,0.8,center,living,Loveseat (1.4m x 0.8m)
+Sectional Sofa,2.4,1.2,0.8,center,living,L-shaped sectional
+Recliner,0.9,0.9,1.0,center,living,Recliner chair
+Armchair,0.8,0.8,0.9,center,living,Armchair
+Accent Chair,0.6,0.6,0.9,center,living,Accent chair
+Office Chair,0.6,0.6,1.2,center,office,Office chair with wheels
+Dining Chair,0.5,0.5,0.9,center,dining,Dining room chair
+Bar Stool,0.4,0.4,1.1,center,dining,Bar stool (0.4m x 0.4m)
+Bench,1.2,0.4,0.5,center,living,Storage bench
+Ottoman,0.8,0.8,0.4,center,living,Ottoman footrest
+
+# TABLES & SURFACES
+Dining Table,1.8,0.9,0.75,dining,dining,6-person dining table
+Small Dining Table,1.2,0.8,0.75,dining,dining,4-person dining table
+Coffee Table,1.2,0.6,0.4,center,living,Coffee table
+Side Table,0.6,0.6,0.6,center,living,Side table
+End Table,0.5,0.5,0.6,center,living,End table
+Console Table,1.2,0.4,0.8,wall,living,Console table
+Desk,1.4,0.7,0.75,window,office,Office desk
+Writing Desk,1.0,0.6,0.75,window,office,Writing desk
+Computer Desk,1.2,0.8,0.75,window,office,Computer desk
+Nightstand,0.5,0.4,0.6,wall,bedroom,Bedside table
+Bedside Table,0.5,0.4,0.6,wall,bedroom,Bedside table
+
+# STORAGE FURNITURE
+Wardrobe,1.8,0.6,2.1,wall,bedroom,Full wardrobe
+Closet,1.2,0.6,2.1,wall,bedroom,Closet
+Dresser,1.2,0.5,0.8,wall,bedroom,Chest of drawers
+Chest of Drawers,1.0,0.5,0.8,wall,bedroom,Chest of drawers
+Bookshelf,0.8,0.3,2.0,wall,living,Tall bookshelf
+Bookcase,1.0,0.3,1.8,wall,living,Bookcase
+TV Stand,1.2,0.4,0.6,wall,living,TV stand
+Entertainment Center,1.8,0.6,0.6,wall,living,Entertainment center
+Cabinet,1.0,0.5,0.8,wall,living,Storage cabinet
+Filing Cabinet,0.5,0.4,1.2,wall,office,File cabinet
+Storage Unit,0.8,0.4,1.0,wall,living,Storage unit
+
+# ELECTRONICS & APPLIANCES
+TV 55 inch,1.2,0.1,0.7,wall,living,55-inch TV
+TV 65 inch,1.4,0.1,0.8,wall,living,65-inch TV
+TV 75 inch,1.7,0.1,0.9,wall,living,75-inch TV
+Soundbar,1.0,0.1,0.1,wall,living,Soundbar
+Speaker,0.3,0.3,0.4,wall,living,Bookshelf speaker
+Floor Speaker,0.3,0.3,0.9,wall,living,Floor standing speaker
+Subwoofer,0.4,0.4,0.4,center,living,Subwoofer
+Projector,0.3,0.2,0.1,wall,living,Video projector
+Laptop,0.4,0.3,0.03,center,office,Laptop computer
+Desktop Computer,0.5,0.4,0.4,center,office,Desktop computer
+Monitor,0.6,0.4,0.1,wall,office,Computer monitor
+Printer,0.4,0.3,0.2,wall,office,Printer
+
+# LIGHTING
+Floor Lamp,0.3,0.3,1.6,center,living,Floor lamp
+Table Lamp,0.2,0.2,0.5,center,living,Table lamp
+Desk Lamp,0.2,0.2,0.4,center,office,Desk lamp
+Chandelier,0.6,0.6,0.3,center,living,Chandelier
+Pendant Light,0.3,0.3,0.2,center,living,Pendant light
+Wall Sconce,0.2,0.1,0.3,wall,living,Wall sconce
+Ceiling Fan,1.2,1.2,0.3,center,living,Ceiling fan with light
+
+# DECORATIVE ITEMS
+Large Mirror,1.2,0.1,1.8,wall,living,Full-length mirror
+Wall Mirror,0.8,0.1,1.2,wall,living,Wall mirror
+Bathroom Mirror,0.6,0.1,0.8,wall,bathroom,Bathroom mirror
+Picture Frame,0.6,0.1,0.8,wall,living,Large picture frame
+Artwork,0.8,0.1,1.0,wall,living,Wall artwork
+Plant Stand,0.4,0.4,0.6,center,living,Plant stand
+Large Plant,0.6,0.6,1.5,center,living,Large potted plant
+Small Plant,0.3,0.3,0.8,center,living,Small potted plant
+Vase,0.2,0.2,0.4,center,living,Decorative vase
+Sculpture,0.3,0.3,0.6,center,living,Decorative sculpture
+Candle,0.1,0.1,0.2,center,living,Candle
+Clock,0.4,0.1,0.4,wall,living,Wall clock
+
+# KITCHEN & DINING
+Kitchen Island,1.2,0.6,0.9,center,kitchen,Kitchen island
+Kitchen Table,1.2,0.8,0.75,center,kitchen,Kitchen table
+Bar Counter,1.5,0.6,1.1,center,kitchen,Bar counter
+Kitchen Cabinet,0.6,0.6,0.9,wall,kitchen,Kitchen cabinet
+Refrigerator,0.7,0.7,1.8,wall,kitchen,Refrigerator
+Dishwasher,0.6,0.6,0.8,wall,kitchen,Dishwasher
+Microwave,0.5,0.4,0.3,wall,kitchen,Microwave oven
+Coffee Maker,0.3,0.2,0.3,center,kitchen,Coffee maker
+Toaster,0.3,0.2,0.2,center,kitchen,Toaster
+
+# BATHROOM
+Bathroom Vanity,1.2,0.6,0.8,wall,bathroom,Bathroom vanity
+Medicine Cabinet,0.6,0.2,0.8,wall,bathroom,Medicine cabinet
+Shower,0.9,0.9,2.0,wall,bathroom,Shower stall
+Bathtub,1.7,0.7,0.6,wall,bathroom,Bathtub
+Toilet,0.4,0.7,0.8,wall,bathroom,Toilet
+Bathroom Storage,0.6,0.3,0.8,wall,bathroom,Bathroom storage
+
+# OUTDOOR
+Patio Table,1.2,1.2,0.75,center,outdoor,Outdoor dining table
+Patio Chair,0.6,0.6,0.9,center,outdoor,Patio chair
+Garden Bench,1.2,0.4,0.5,center,outdoor,Garden bench
+Outdoor Plant,0.5,0.5,1.2,center,outdoor,Large outdoor plant
+
+# ARCHITECTURAL ELEMENTS
+Standard Door,0.9,0.1,2.1,wall,architectural,Standard interior door
+Wide Door,1.2,0.1,2.1,wall,architectural,Wide interior door
+Sliding Door,1.8,0.1,2.1,wall,architectural,Sliding door
+Window,1.2,0.1,1.2,wall,architectural,Standard window
+Large Window,1.8,0.1,1.5,wall,architectural,Large window
+Bay Window,2.4,0.1,1.2,wall,architectural,Bay window
+Fireplace,1.5,0.6,1.2,wall,architectural,Fireplace
+Stairs,1.2,0.8,2.4,wall,architectural,Staircase
