@@ -1,6 +1,0 @@
-train: data/datasets/train/images
-val: data/datasets/val/images
-test: data/datasets/test/images
-
-nc: 10
-names: ['bed','sofa','chair','table','tv','window','door','wardrobe','lamp','desk']
