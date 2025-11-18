@@ -219,12 +219,6 @@ def main():
     
     image = None
     if uploaded_file is not None:
-        # Temporary debug information about the uploaded file
-        try:
-            st.caption(f"[DEBUG] Uploaded file: name={uploaded_file.name}, type={uploaded_file.type}, size={uploaded_file.size} bytes")
-        except Exception:
-            pass
-
         try:
             # Read the raw bytes from the uploaded file and wrap in a BytesIO
             file_bytes = uploaded_file.getvalue()
@@ -238,7 +232,7 @@ def main():
             image = None
 
     if image is not None:
-        st.image(image, caption="Your Room Image", use_container_width=True)
+        st.image(image, caption="Your Room Image", width="stretch")
     else:
         st.info("👆 Please upload a room image to get started")
     
@@ -513,7 +507,7 @@ def main():
     _backend_key = "enhanced" if detector_backend_label.startswith("Enhanced") else "cnn"
     
     if uploaded_file and selected_furniture:
-        if st.button("🚀 Start AI Room Optimization", type="primary", use_container_width=True):
+        if st.button("🚀 Start AI Room Optimization", type="primary", width="stretch"):
             # Initialize AI Room Optimizer
             with st.spinner("🧠 Initializing AI Room Optimizer..."):
                 st.session_state.room_optimizer = AIRoomOptimizer(
@@ -655,7 +649,7 @@ def main():
         st.markdown("### 🏠 Optimized Room Layout")
         layout_image = results.get('layout_image')
         if layout_image:
-            st.image(layout_image, caption="AI-Optimized Room Layout", use_container_width=True)
+            st.image(layout_image, caption="AI-Optimized Room Layout", width="stretch")
 
         # Raw detections summary
         with st.expander("🔍 Show detected objects (from image)"):

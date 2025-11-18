@@ -78,6 +78,7 @@ class AIRoomOptimizer:
         self.architectural_elements = []
         self.furniture_layout = []
         self.optimizer_diagnostics: List[Dict] = []
+        self.last_method: str = "none"  # 'llm_constraint_solver' or 'genetic_algorithm_fallback'
     
     def analyze_room(self, image_path: str) -> Dict:
         """
@@ -564,6 +565,7 @@ class AIRoomOptimizer:
             combined_layout = layout
             logger.info("✅ LLM pipeline succeeded")
             self.optimizer_diagnostics = []
+            self.last_method = "llm_constraint_solver"
         except LLMUnavailableError as e:
             # Expected fallback case
             logger.warning("⚠️ LLM unavailable, falling back to GA: %s", e)
@@ -596,6 +598,7 @@ class AIRoomOptimizer:
                 self.optimizer_diagnostics = getattr(optimizer, "diagnostics", []) or []
             except Exception:
                 self.optimizer_diagnostics = []
+            self.last_method = "genetic_algorithm_fallback"
         
         # Separate furniture from architectural elements in the optimized layout
         self.furniture_layout = []
@@ -935,11 +938,29 @@ class AIRoomOptimizer:
         
         # Calculate metrics with real-world dimensions
         room_area = (self.room_dims[0] * self.room_dims[1]) / 10000  # m²
-        furniture_area = sum(obj["w"] * obj["h"] for obj in optimized_furniture) / 10000  # m²
+
+        def _footprint_wh(obj: Dict) -> Tuple[float, float]:
+            """Robustly get furniture footprint (w,h) in cm from various keys."""
+            w = float(
+                obj.get("w",
+                        obj.get("w_cm",
+                                obj.get("width", 0.0)))
+            )
+            h = float(
+                obj.get("h",
+                        obj.get("h_cm",
+                                obj.get("depth", obj.get("height", 0.0))))
+            )
+            return max(0.0, w), max(0.0, h)
+
+        furniture_area = sum(_footprint_wh(obj)[0] * _footprint_wh(obj)[1] for obj in optimized_furniture) / 10000  # m²
         space_utilization = (furniture_area / room_area) * 100 if room_area > 0 else 0
         
         # Calculate total furniture volume for better space analysis
-        total_furniture_volume = sum(obj["w"] * obj["h"] * obj.get("height", 80) for obj in optimized_furniture) / 1000000  # m³
+        total_furniture_volume = sum(
+            _footprint_wh(obj)[0] * _footprint_wh(obj)[1] * float(obj.get("height", obj.get("height_cm", 80)))
+            for obj in optimized_furniture
+        ) / 1000000  # m³
         
         # Calculate optimization score
         optimization_score = self._calculate_optimization_score(optimized_furniture, room_analysis)
@@ -956,7 +977,11 @@ class AIRoomOptimizer:
                 "optimization_score": optimization_score,
                 "architectural_elements_count": len(self.architectural_elements),
                 "furniture_items_count": len(optimized_furniture),
-                "average_furniture_size_cm": sum(obj["w"] * obj["h"] for obj in optimized_furniture) / len(optimized_furniture) if optimized_furniture else 0
+                "average_furniture_size_cm": (
+                    sum(_footprint_wh(obj)[0] * _footprint_wh(obj)[1] for obj in optimized_furniture) / len(optimized_furniture)
+                    if optimized_furniture else 0
+                ),
+                "optimizer_method": getattr(self, "last_method", "unknown"),
             },
             "room_type": self.room_type,
             "recommendations": self._generate_recommendations(room_analysis, optimized_furniture)
@@ -992,6 +1017,27 @@ class AIRoomOptimizer:
         
         return max(0, score)
     
+    def _footprint_wh_safe(self, obj: Dict) -> Tuple[float, float]:
+        """Robustly get furniture footprint (w,h) in cm from various keys.
+
+        Supports legacy GA layouts (w/h), solver outputs (w_cm/h_cm), and
+        more generic width/depth/height-style keys. Never raises KeyError.
+        """
+        try:
+            w = float(
+                obj.get("w",
+                        obj.get("w_cm",
+                                obj.get("width", 0.0)))
+            )
+            h = float(
+                obj.get("h",
+                        obj.get("h_cm",
+                                obj.get("depth", obj.get("height", 0.0))))
+            )
+        except Exception:
+            w, h = 0.0, 0.0
+        return max(0.0, w), max(0.0, h)
+
     def _calculate_relationship_bonus(self, furniture_layout: List[Dict]) -> float:
         """Calculate bonus for good furniture relationships."""
         bonus = 0.0
@@ -1032,7 +1078,9 @@ class AIRoomOptimizer:
         # Bonus for placing seating near windows
         for obj in furniture_layout:
             if obj.get("type", "").lower() in ["chair", "sofa", "desk"]:
-                obj_center = (obj["x"] + obj["w"]/2, obj["y"] + obj["h"]/2)
+                w, h = self._footprint_wh_safe(obj)
+                x = float(obj.get("x", 0.0)); y = float(obj.get("y", 0.0))
+                obj_center = (x + w/2, y + h/2)
                 
                 for window in windows:
                     wx1, wy1, wx2, wy2 = window["bbox"]
@@ -1045,7 +1093,9 @@ class AIRoomOptimizer:
         
         # Penalty for blocking doors
         for obj in furniture_layout:
-            obj_center = (obj["x"] + obj["w"]/2, obj["y"] + obj["h"]/2)
+            w, h = self._footprint_wh_safe(obj)
+            x = float(obj.get("x", 0.0)); y = float(obj.get("y", 0.0))
+            obj_center = (x + w/2, y + h/2)
             
             for door in doors:
                 dx1, dy1, dx2, dy2 = door["bbox"]
@@ -1064,7 +1114,10 @@ class AIRoomOptimizer:
             return 0.0
         
         # Calculate furniture area
-        furniture_area = sum(obj["w"] * obj["h"] for obj in furniture_layout)
+        furniture_area = 0.0
+        for obj in furniture_layout:
+            w, h = self._footprint_wh_safe(obj)
+            furniture_area += w * h
         room_area = self.room_dims[0] * self.room_dims[1]
         utilization = furniture_area / room_area if room_area > 0 else 0
         
@@ -1087,10 +1140,10 @@ class AIRoomOptimizer:
         room_area = room_width * room_length
 
         # Calculate furniture coverage
-        total_furniture_area = sum(
-            float(item.get("w", 0.0)) * float(item.get("h", 0.0))
-            for item in layout
-        )
+        total_furniture_area = 0.0
+        for item in layout:
+            w, h = self._footprint_wh_safe(item)
+            total_furniture_area += w * h
         coverage_ratio = (total_furniture_area / room_area) if room_area > 0 else 0.0
 
         metrics: Dict[str, Any] = {
@@ -1115,7 +1168,10 @@ class AIRoomOptimizer:
             recommendations.append("Consider adding more lighting fixtures near seating areas")
         
         # Space utilization recommendations
-        furniture_area = sum(obj["w"] * obj["h"] for obj in furniture_layout)
+        furniture_area = 0.0
+        for obj in furniture_layout:
+            w, h = self._footprint_wh_safe(obj)
+            furniture_area += w * h
         room_area = self.room_dims[0] * self.room_dims[1]
         utilization = furniture_area / room_area if room_area > 0 else 0
         
@@ -1135,15 +1191,22 @@ class AIRoomOptimizer:
     
     def _overlap(self, a: Dict, b: Dict) -> bool:
         """Check if two objects overlap."""
-        return not (a["x"] + a["w"] <= b["x"] or b["x"] + b["w"] <= a["x"] or 
-                   a["y"] + a["h"] <= b["y"] or b["y"] + b["h"] <= a["y"])
+        ax = float(a.get("x", 0.0)); ay = float(a.get("y", 0.0))
+        bx = float(b.get("x", 0.0)); by = float(b.get("y", 0.0))
+        aw, ah = self._footprint_wh_safe(a)
+        bw, bh = self._footprint_wh_safe(b)
+        if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+            return False
+        return not (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
     
     def _center_distance(self, a: Dict, b: Dict) -> float:
         """Calculate distance between centers of two objects."""
-        ax = a["x"] + a["w"] / 2.0
-        ay = a["y"] + a["h"] / 2.0
-        bx = b["x"] + b["w"] / 2.0
-        by = b["y"] + b["h"] / 2.0
+        aw, ah = self._footprint_wh_safe(a)
+        bw, bh = self._footprint_wh_safe(b)
+        ax = float(a.get("x", 0.0)) + aw / 2.0
+        ay = float(a.get("y", 0.0)) + ah / 2.0
+        bx = float(b.get("x", 0.0)) + bw / 2.0
+        by = float(b.get("y", 0.0)) + bh / 2.0
         return np.sqrt((ax - bx)**2 + (ay - by)**2)
     
     def export_results(self, output_path: str) -> Dict:

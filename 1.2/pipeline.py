@@ -79,7 +79,14 @@ def run_pipeline(
             room_type=room_type,
         )
 
-        if not proposal or "layout_proposal" not in proposal:
+        # Consider proposals with no items as failure so that the caller can
+        # fall back to the GA optimizer when both OpenAI and Ollama fail or
+        # return unusable results.
+        if (
+            not proposal
+            or "layout_proposal" not in proposal
+            or not proposal.get("layout_proposal")
+        ):
             raise LLMUnavailableError("LLM returned empty or invalid proposal")
 
         furniture_items = proposal.get("layout_proposal", [])

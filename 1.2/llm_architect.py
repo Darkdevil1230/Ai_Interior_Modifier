@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
+import requests
+
 try:
     from openai import OpenAI
 except Exception:  # pragma: no cover
@@ -141,6 +143,11 @@ def _build_user_payload(detections: Dict[str, Any], room_dims_cm: Tuple[float, f
 
 
 def _get_openai_client() -> Any:
+    """Return an OpenAI client using env or local config.
+
+    This is used as the primary LLM backend when an API key is available.
+    """
+
     if OpenAI is None:
         raise RuntimeError("openai package is not available")
     api_key = os.getenv("OPENAI_API_KEY")
@@ -161,28 +168,110 @@ def _get_openai_client() -> Any:
     return OpenAI(api_key=api_key)
 
 
-def call_llm_for_layout(detections: Dict[str, Any], room_dims_cm: Tuple[float, float]) -> Dict[str, Any]:
-    payload = _build_user_payload(detections, room_dims_cm)
-    client = _get_openai_client()
+def _call_openai_backend(payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Try calling OpenAI GPT-4.1.
 
-    response = client.chat.completions.create(
-        model="gpt-4.1",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        temperature=0.1,
-    )
+    Returns a parsed JSON dict or None if anything fails (missing key, API error,
+    malformed JSON, etc.).
+    """
 
-    content = response.choices[0].message.content
     try:
-        data = json.loads(content)
+        client = _get_openai_client()
     except Exception:
-        # Fallback: return an empty proposal structure
-        data = {"layout_proposal": [], "zones": {}, "notes": "Malformed LLM JSON, empty proposal."}
-    if "layout_proposal" not in data:
-        data.setdefault("layout_proposal", [])
-    data.setdefault("zones", {})
-    data.setdefault("notes", "")
-    return data
+        return None
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            temperature=0.1,
+        )
+        content = response.choices[0].message.content
+        if isinstance(content, dict):
+            return content
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def _call_ollama_backend(payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Call a local Ollama model via its OpenAI-compatible chat API.
+
+    Expects an Ollama server running locally (default http://localhost:11434)
+    and a model name provided via OLLAMA_MODEL (default "qwen2.5"). Returns a
+    parsed JSON object or None on failure.
+    """
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    model = os.getenv("OLLAMA_MODEL", "qwen2.5")
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+
+    try:
+        resp = requests.post(
+            url,
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(payload)},
+                ],
+                "temperature": 0.1,
+            },
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        if isinstance(content, dict):
+            return content
+        try:
+            return json.loads(content)
+        except Exception:
+            # Try to extract JSON from mixed text
+            import re
+
+            m = re.search(r"(\{[\s\S]*\})", content)
+            if m:
+                return json.loads(m.group(1))
+            return None
+    except Exception:
+        return None
+
+
+def call_llm_for_layout(detections: Dict[str, Any], room_dims_cm: Tuple[float, float]) -> Dict[str, Any]:
+    """High-level entrypoint for the planner LLM.
+
+    Behavior:
+      1. Try OpenAI GPT-4.1 (if configured).
+      2. If that fails, try local Ollama (qwen2.5 by default).
+      3. If both fail, return an empty layout structure so that the
+         upstream pipeline can treat it as an LLMUnavailable case and
+         fall back to the GA optimizer.
+    """
+
+    payload = _build_user_payload(detections, room_dims_cm)
+
+    # 1) OpenAI
+    res = _call_openai_backend(payload)
+    if isinstance(res, dict) and "layout_proposal" in res:
+        res.setdefault("zones", {})
+        res.setdefault("notes", "")
+        res["_source"] = "openai"
+        return res
+
+    # 2) Ollama local backend
+    res = _call_ollama_backend(payload)
+    if isinstance(res, dict) and "layout_proposal" in res:
+        res.setdefault("zones", {})
+        res.setdefault("notes", "")
+        res["_source"] = "ollama"
+        return res
+
+    # 3) Both backends failed: return an empty structure so that the
+    # pipeline can raise LLMUnavailableError and trigger GA fallback.
+    return {"layout_proposal": [], "zones": {}, "notes": ""}

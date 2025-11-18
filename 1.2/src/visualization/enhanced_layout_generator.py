@@ -347,8 +347,30 @@ class EnhancedLayoutGenerator:
         """Draw furniture layout with detailed styling."""
         for furniture in self.furniture_layout:
             furniture_type = furniture.get("type", "").lower()
-            x, y, w, h = furniture["x"], furniture["y"], furniture["w"], furniture["h"]
-            
+
+            # Robustly obtain position and size: support both (x,y,w,h) and
+            # (x,y,w_cm,h_cm) keys coming from different optimizers/solvers.
+            try:
+                x = float(furniture.get("x", 0.0))
+                y = float(furniture.get("y", 0.0))
+                w = float(
+                    furniture.get("w",
+                                  furniture.get("w_cm",
+                                                furniture.get("width", 0.0)))
+                )
+                h = float(
+                    furniture.get("h",
+                                  furniture.get("h_cm",
+                                                furniture.get("height", 0.0)))
+                )
+            except Exception:
+                # If we cannot parse dimensions, skip this item
+                continue
+
+            if w <= 0 or h <= 0:
+                # Skip items without usable footprint
+                continue
+
             # Choose appropriate drawer based on furniture type
             if "bed" in furniture_type:
                 self._draw_bed(ax, x, y, w, h)
@@ -370,6 +392,7 @@ class EnhancedLayoutGenerator:
                 self._draw_plant(ax, x, y, w, h)
             else:
                 self._draw_generic_furniture(ax, x, y, w, h, furniture_type)
+
             # Dimension annotations for each furniture
             self._annotate_item_dimensions(ax, x, y, w, h)
     
