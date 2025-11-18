@@ -10,7 +10,7 @@ import tempfile
 import json
 import os
 from io import BytesIO
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import numpy as np
 
 # Import our enhanced modules
@@ -217,8 +217,27 @@ def main():
         help="Upload a clear photo of your room for AI analysis"
     )
     
-    if uploaded_file:
-        image = Image.open(uploaded_file).convert("RGB")
+    image = None
+    if uploaded_file is not None:
+        # Temporary debug information about the uploaded file
+        try:
+            st.caption(f"[DEBUG] Uploaded file: name={uploaded_file.name}, type={uploaded_file.type}, size={uploaded_file.size} bytes")
+        except Exception:
+            pass
+
+        try:
+            # Read the raw bytes from the uploaded file and wrap in a BytesIO
+            file_bytes = uploaded_file.getvalue()
+            from io import BytesIO
+            image = Image.open(BytesIO(file_bytes)).convert("RGB")
+        except UnidentifiedImageError:
+            st.error("Could not read the uploaded file as an image. Please upload a valid JPG or PNG file.")
+            image = None
+        except Exception as e:
+            st.error(f"Unexpected error while reading image: {e}")
+            image = None
+
+    if image is not None:
         st.image(image, caption="Your Room Image", use_container_width=True)
     else:
         st.info("👆 Please upload a room image to get started")

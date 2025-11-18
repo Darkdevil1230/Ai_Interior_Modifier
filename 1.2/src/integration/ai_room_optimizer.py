@@ -9,6 +9,7 @@ import os
 import tempfile
 from typing import List, Dict, Tuple, Optional
 import numpy as np
+import pandas as pd
 from PIL import Image
 import io
 
@@ -20,8 +21,9 @@ try:
     from src.input.enhanced_architectural_detector import EnhancedArchitecturalDetector
 except Exception:
     EnhancedArchitecturalDetector = None  # type: ignore
-from src.optimization.cnn_guided_optimizer import CNNGuidedOptimizer
 from src.visualization.enhanced_layout_generator import EnhancedLayoutGenerator
+from src.optimization.cnn_guided_optimizer import CNNGuidedOptimizer
+from pipeline import run_pipeline, LLMUnavailableError
 
 class AIRoomOptimizer:
     """
@@ -521,48 +523,79 @@ class AIRoomOptimizer:
     
     def optimize_furniture_placement(self, furniture_list: List[Dict], 
                                     user_preferences: Dict = None) -> List[Dict]:
-        """
-        Optimize furniture placement using CNN-guided genetic algorithm.
+        """Optimize furniture placement using LLM architect + constraint solver pipeline.
+
+        Falls back to the GA-based CNNGuidedOptimizer if the LLM is unavailable or
+        if unexpected errors occur in the pipeline.
         """
         if not self.room_analysis:
             raise ValueError("Room analysis must be performed first. Call analyze_room() before optimization.")
-        
+
+        import logging
+
+        logger = logging.getLogger(__name__)
+
         # Validate furniture selection first
         validated_furniture = self.validate_furniture_selection(furniture_list)
-        
+
         if not validated_furniture:
             raise ValueError("No valid furniture items selected for this room size.")
-        
-        print("[AI Room Optimizer] Starting CNN-guided optimization...")
-        
-        # Generate unique seed based on room analysis to ensure different layouts for different rooms
-        import time
-        import hashlib
-        
-        # Create seed from room characteristics to ensure different rooms get different layouts
-        room_signature = f"{self.room_dims[0]}_{self.room_dims[1]}_{len(furniture_list)}_{time.time()}"
-        seed_hash = int(hashlib.md5(room_signature.encode()).hexdigest()[:8], 16)
-        
-        print(f"[AI Room Optimizer] Using unique seed: {seed_hash} for room-specific layout")
-        
-        # Initialize CNN-guided optimizer
-        optimizer = CNNGuidedOptimizer(
-            room_dims=self.room_dims,
-            objects=validated_furniture,
-            room_analysis=self.room_analysis,
-            user_prefs=user_preferences,
-            population_size=200,  # Increased for better results
-            generations=300,      # Increased for convergence
-            seed=seed_hash  # Unique seed per room/session
-        )
-        
-        # Run optimization
-        combined_layout = optimizer.optimize()
-        # Capture diagnostics for visualization
+
+        logger.info("[AI Room Optimizer] Starting LLM+CP-SAT optimization pipeline...")
+
+        # Prepare inputs for the pipeline
+        room_data = dict(self.room_analysis or {})
+        detected_openings: List[Dict] = room_data.get("detections", [])
+        furniture_catalog = pd.DataFrame(validated_furniture)
+
+        combined_layout: List[Dict]
+
+        # TRY: LLM Architect + CP-SAT Pipeline
         try:
-            self.optimizer_diagnostics = getattr(optimizer, "diagnostics", []) or []
-        except Exception:
+            logger.info("🚀 Attempting LLM + Constraint Solver pipeline...")
+            layout = run_pipeline(
+                room_data=room_data,
+                room_dims=self.room_dims,
+                detected_openings=detected_openings,
+                furniture_catalog=furniture_catalog,
+                room_type=self.room_type or "living_room",
+                api_key=None,
+            )
+            combined_layout = layout
+            logger.info("✅ LLM pipeline succeeded")
             self.optimizer_diagnostics = []
+        except LLMUnavailableError as e:
+            # Expected fallback case
+            logger.warning("⚠️ LLM unavailable, falling back to GA: %s", e)
+        except Exception as e:  # noqa: BLE001
+            # Unexpected error - log but don't hide it
+            logger.exception("❌ Unexpected error in LLM pipeline: %s", e)
+            logger.warning("⚠️ Falling back to GA optimizer due to unexpected error")
+
+        # FALLBACK: Genetic Algorithm (if combined_layout not set)
+        if "combined_layout" not in locals():
+            logger.info("🧬 Using GA optimizer fallback...")
+            import time
+            import hashlib
+
+            room_signature = f"{self.room_dims[0]}_{self.room_dims[1]}_{len(validated_furniture)}_{time.time()}"
+            seed_hash = int(hashlib.md5(room_signature.encode()).hexdigest()[:8], 16)
+            logger.info("[AI Room Optimizer] Using GA fallback with seed: %d", seed_hash)
+
+            optimizer = CNNGuidedOptimizer(
+                room_dims=self.room_dims,
+                objects=validated_furniture,
+                room_analysis=self.room_analysis,
+                user_prefs=user_preferences,
+                population_size=200,
+                generations=300,
+                seed=seed_hash,
+            )
+            combined_layout = optimizer.optimize()
+            try:
+                self.optimizer_diagnostics = getattr(optimizer, "diagnostics", []) or []
+            except Exception:
+                self.optimizer_diagnostics = []
         
         # Separate furniture from architectural elements in the optimized layout
         self.furniture_layout = []
@@ -585,6 +618,13 @@ class AIRoomOptimizer:
         except Exception:
             pass
         
+        # Optional: compute and store metrics for the final layout
+        try:
+            metrics = self._calculate_metrics(self.furniture_layout, self.room_dims, self.room_analysis.get("detections", []))
+            setattr(self, "last_metrics", metrics)
+        except Exception:
+            pass
+
         print(f"[AI Room Optimizer] Optimization complete. Generated layout with {len(self.furniture_layout)} furniture items + {len(self.architectural_elements)} architectural elements")
         
         return self.furniture_layout
@@ -1035,6 +1075,35 @@ class AIRoomOptimizer:
             return 50 * utilization / 0.3
         else:
             return max(0, 100 - (utilization - 0.5) * 200)
+
+    def _calculate_metrics(self, layout: List[Dict], room_dims: Tuple[float, float], detected_openings: List[Dict]) -> Dict:
+        """Calculate layout quality metrics including room coverage.
+
+        Room coverage is expressed as a percentage of floor area occupied by
+        furniture footprints.
+        """
+
+        room_width, room_length = room_dims
+        room_area = room_width * room_length
+
+        # Calculate furniture coverage
+        total_furniture_area = sum(
+            float(item.get("w", 0.0)) * float(item.get("h", 0.0))
+            for item in layout
+        )
+        coverage_ratio = (total_furniture_area / room_area) if room_area > 0 else 0.0
+
+        metrics: Dict[str, Any] = {
+            "furniture_count": len(layout),
+            "room_coverage": round(coverage_ratio * 100, 1),  # percentage
+            "coverage_status": "optimal"
+            if 0.35 < coverage_ratio < 0.60
+            else "too_crowded"
+            if coverage_ratio > 0.60
+            else "sparse",
+        }
+
+        return metrics
     
     def _generate_recommendations(self, room_analysis: Dict, furniture_layout: List[Dict]) -> List[str]:
         """Generate recommendations based on analysis."""

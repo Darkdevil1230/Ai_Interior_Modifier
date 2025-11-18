@@ -58,6 +58,24 @@ streamlit run app_simple.py
 python run_app.py
 ```
 
+## 📦 Dependencies Explained
+
+### Required (Core Functionality):
+- `numpy`, `opencv-python`, `matplotlib`, `Pillow` - Image processing & visualization
+- `ortools` - Constraint solver (CP-SAT)
+- `transformers`, `torch`, `timm` - Florence-2 & MiDaS models
+
+### Optional (Enhanced Features):
+- `openai` - GPT-4 Vision for LLM architect pipeline
+- `anthropic` - Claude API (alternative to GPT-4)
+- `google-generativeai` - Gemini API (alternative to GPT-4)
+- `streamlit` - Web interface
+
+### Model Downloads (First Run):
+- Florence-2 (~230MB) - VLM for room understanding
+- MiDaS (~100MB) - Depth estimation
+These download automatically on first use if GPU available.
+
 ### Usage
 
 1. **Upload Image**: Choose a room photo (bedroom, living room, etc.)

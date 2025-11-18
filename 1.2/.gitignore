@@ -56,3 +56,4 @@ tmp/
 layout.png
 optimized_layout.json
 demo_result.json
+local_openai_config.json

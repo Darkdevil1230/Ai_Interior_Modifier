@@ -1,0 +1,604 @@
+
+
+1. an LLM “architect” that *proposes* human-like layouts from the image + detections, and
+2. a Constraint Solver (OR-Tools CP-SAT) that *validates & enforces* strict architectural constraints (doors, windows, clearances, wall anchoring, traffic flow).
+
+Below I give you: a clear architecture, exact prompt templates, JSON schemas, and **ready-to-drop** Python modules:
+
+* `llm_architect.py` — call any LLM API (replace with your provider + key). Sends room facts and gets layout proposals.
+* `constraint_solver.py` — OR-Tools CP-SAT model that enforces hard constraints and nudges the LLM proposal to satisfy them.
+* `pipeline.py` — glue: detections → LLM → constraint solver → final layout JSON → visualization hook.
+
+Use these as Windsurf/Cursor inputs (or paste as files). I keep provider calls generic so you can adapt to OpenAI / other LLM APIs.
+
+---
+
+## Quick architecture (one-liner)
+
+`Detections → preprocess → LLM Architect (propose) → Constraint Solver (fix) → Optimizer/Renderer`
+
+---
+
+## 1) JSON schemas & data conventions (canonical)
+
+**Detections input (what your detector produces):**
+
+```json
+{
+  "image": "file_or_url",
+  "width": 1920,
+  "height": 1080,
+  "room_dims_cm": [400, 300],       # optional, real width & height in cm if available
+  "detected": [
+    {"type":"window","bbox":[x1,y1,x2,y2],"center":[cx,cy]},
+    {"type":"door","bbox":[...],"center":[...]},
+    {"type":"sofa","bbox":[...],"center":[...],"orientation":0},
+    ...
+  ]
+}
+```
+
+**LLM Layout Proposal (what the LLM should return):**
+
+```json
+{
+  "layout_proposal": [
+    {"id":"s1","type":"sofa","x":200,"y":100,"w_cm":210,"h_cm":90,"orientation":180},
+    {"id":"t1","type":"tv","x":200,"y":30,"w_cm":120,"h_cm":10,"orientation":0},
+    {"id":"p1","type":"plant","x":30,"y":60,"w_cm":30,"h_cm":30},
+    ...
+  ],
+  "zones": {
+    "tv_zone": {"center":[200,120], "radius":160},
+    "reading_zone": { ... }
+  },
+  "notes": "explanation of choices (optional)"
+}
+```
+
+**Final output (after solver):**
+
+```json
+{
+  "final_layout": [...],   # same format as layout_proposal (but valid)
+  "violations": [],        # empty or list of softened violations
+  "score": 852.3
+}
+```
+
+---
+
+## 2) `llm_architect.py` — call an LLM to propose layouts
+
+Paste this into `llm_architect.py`. Replace `LLM_REQUEST` with your provider (OpenAI / other). The code expects `detections` dict (as above).
+
+```python
+# llm_architect.py
+```
+# llm_architect.py
+import json
+from openai import OpenAI
+
+client = OpenAI(api_key="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")
+
+ARCHITECT_PROMPT = """
+You are a certified interior architect with 15+ years experience.
+Your job: take object detections + room dimensions and propose a realistic,
+architect-grade furniture layout.
+
+STRICT RULES:
+- Output only JSON (no text outside JSON).
+- Units must be in centimeters.
+- Room origin (0,0) is top-left corner.
+- Ensure 80–120 cm pathways. Never block movement.
+- Doors: 90 cm swing clearance (circular arc).
+- Windows: avoid blocking natural light; heavy furniture must not be placed in front.
+- Sofas must face TV. Viewing distance = 150–300 cm.
+- Mirrors should not be placed randomly — place near entry, behind sofa, or beside wardrobes.
+- Work desks should be near natural light.
+- Plants should be placed near windows (within 100 cm).
+- Beds & wardrobes must anchor to walls only.
+- No furniture overlap, no floating items.
+- Use correct proportions & spacing.
+
+Return ONLY JSON with:
+{
+ "layout_proposal": [...],
+ "zones": {...},
+ "notes": "..."
+}
+"""
+
+def call_llm_for_layout(detections, room_dims_cm=(400,300)):
+    prompt_json = {
+        "room_dims_cm": room_dims_cm,
+        "detected": detections["detected"]
+    }
+
+    response = client.chat.completions.create(
+        model="gpt-4.1",
+        response_format={"type":"json_object"},
+        messages=[
+            {"role":"system","content":ARCHITECT_PROMPT},
+            {"role":"user","content":json.dumps(prompt_json)}
+        ],
+        temperature=0.1
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+**Notes:**
+
+* Use low temperature for deterministic outputs.
+* If using OpenAI/other, adapt the HTTP payload to their spec (messages/or prompt format).
+
+---
+
+## 3) `constraint_solver.py` — OR-Tools CP-SAT enforcement & correction
+
+This will take LLM proposal and enforce hard constraints. Save as `constraint_solver.py`.
+
+```python
+# constraint_solver.py
+# constraint_solver.py
+from ortools.sat.python import cp_model
+import math
+
+def enforce_constraints(room_w, room_h, detections, proposal):
+    model = cp_model.CpModel()
+    items = proposal["layout_proposal"]
+
+    n = len(items)
+    X = [model.NewIntVar(0, room_w, f"x{i}") for i in range(n)]
+    Y = [model.NewIntVar(0, room_h, f"y{i}") for i in range(n)]
+
+    W = [int(item["w_cm"]) for item in items]
+    H = [int(item["h_cm"]) for item in items]
+
+    # Keep inside room
+    for i in range(n):
+        model.Add(X[i] >= W[i]//2)
+        model.Add(X[i] <= room_w - W[i]//2)
+        model.Add(Y[i] >= H[i]//2)
+        model.Add(Y[i] <= room_h - H[i]//2)
+
+    # Door clearance
+    for det in detections:
+        if det["type"] == "door":
+            dx, dy = det["center"]
+            clearance = 90
+            for i in range(n):
+                dist_x = model.NewIntVar(0, 2000, f"dx_door{i}")
+                dist_y = model.NewIntVar(0, 2000, f"dy_door{i}")
+                model.AddAbsEquality(dist_x, X[i] - dx)
+                model.AddAbsEquality(dist_y, Y[i] - dy)
+                # Force at least one is greater than clearance (approx.)
+                b = model.NewBoolVar("")
+                model.Add(dist_x >= clearance).OnlyEnforceIf(b)
+                model.Add(dist_y >= clearance).OnlyEnforceIf(b)
+                model.AddBoolOr([b])
+
+    # No overlap
+    for i in range(n):
+        for j in range(i+1, n):
+            b1 = model.NewBoolVar("")
+            b2 = model.NewBoolVar("")
+            b3 = model.NewBoolVar("")
+            b4 = model.NewBoolVar("")
+            model.Add(X[i]*2 + W[i] <= X[j]*2 - W[j]).OnlyEnforceIf(b1)
+            model.Add(X[j]*2 + W[j] <= X[i]*2 - W[i]).OnlyEnforceIf(b2)
+            model.Add(Y[i]*2 + H[i] <= Y[j]*2 - H[j]).OnlyEnforceIf(b3)
+            model.Add(Y[j]*2 + H[j] <= Y[i]*2 - H[i]).OnlyEnforceIf(b4)
+            model.AddBoolOr([b1,b2,b3,b4])
+
+    # Try to stay close to LLM suggestion
+    objective_terms = []
+    for i,item in enumerate(items):
+        dx = model.NewIntVar(0, room_w, f"dx_sugg{i}")
+        dy = model.NewIntVar(0, room_h, f"dy_sugg{i}")
+        model.AddAbsEquality(dx, X[i] - int(item["x"]))
+        model.AddAbsEquality(dy, Y[i] - int(item["y"]))
+        objective_terms += [dx, dy]
+
+    model.Minimize(sum(objective_terms))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 5
+    solver.parameters.num_search_workers = 8
+
+    res = solver.Solve(model)
+    final = []
+    if res in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        for i,item in enumerate(items):
+            final.append({
+                "id": item["id"],
+                "type": item["type"],
+                "x": solver.Value(X[i]),
+                "y": solver.Value(Y[i]),
+                "w_cm": item["w_cm"],
+                "h_cm": item["h_cm"],
+                "orientation": item["orientation"]
+            })
+    else:
+        final = items
+
+    return final
+```
+
+**Notes and realities:**
+
+* I give a runnable structure. Door clearance exact disjunction encoding is lengthy — you should use OR-Tools' `AddAllowedAssignments` or binary indicator patterns for exact disjunctions. Windsurf can implement precise big-M encodings.
+* Use `solver.parameters.max_time_in_seconds` to limit runtime for production.
+
+---
+
+## 4) `pipeline.py` — glue everything together
+
+```python
+# pipeline.py
+# pipeline.py
+import json
+from llm_architect import call_llm_for_layout
+from constraint_solver import enforce_constraints
+
+def run_pipeline(detections, room_dims_cm=(400,300)):
+    proposal = call_llm_for_layout(detections, room_dims_cm)
+    final_layout = enforce_constraints(
+        room_dims_cm[0], 
+        room_dims_cm[1], 
+        detections["detected"], 
+        proposal
+    )
+    result = {
+        "final_layout": final_layout,
+        "notes": proposal.get("notes","")
+    }
+    with open("final_layout.json","w") as f:
+        json.dump(result,f,indent=2)
+    return result
+
+```
+
+---
+
+## 5) Prompt engineering — high-quality prompt for LLM Architect
+
+Use this prompt (already embedded in `llm_architect.py`) — but be precise about units (cm), coordinate origin (top-left), and required JSON-only output. Example extra instructions:
+
+```
+IMPORTANT:
+- Use top-left corner of room as origin (0,0). Units: centimeters.
+- Room width, height given as room_dims_cm.
+- Output only valid JSON with keys: layout_proposal, zones, notes.
+- layout_proposal entries must include id, type, x, y, w_cm, h_cm, orientation.
+- Avoid placing objects within 'door swing' and 'window blocking' areas.
+- Provide best justification short note string.
+```
+
+---
+
+## 6) Integration checklist for Windsurf/Cursor — what to do now (exact)
+
+1. Add `llm_architect.py`, `constraint_solver.py`, `pipeline.py` to repo.
+2. Wire your detector output into `pipeline_run(detections, room_dims_cm)`.
+3. Ensure `detections["detected"]` contain doors and windows with coordinates in cm (or perform pixel→cm mapping first).
+4. Provide an LLM provider key and endpoint in `llm_architect.py`. Use env vars in production.
+5. Tune CP-SAT solver time budget (`max_time_in_seconds`).
+6. Run end-to-end: confirm `final_layout.json` looks good; visualize with your `plot2d.py`.
+7. If constraint solver fails to find feasible, relax soft constraints or increase solver time.
+
+---
+
+## 7) Performance & fallback strategy
+
+* **Fast path**: If low latency is required, call LLM with conservative layout request and run solver with small time budget (2–6s). Use LLM output as fallback if solver fails.
+* **Quality path**: For heavy runs (batch generation, precompute), increase CP-SAT time limit to 30–60s. Better solutions.
+* **Fallback**: If LLM returns malformed JSON, fall back to a rule-based deterministic layout (your previous optimizer) and log error.
+
+---
+
+## 8) Human-in-the-loop & learning
+
+* Store LLM proposals and final layouts along with user approvals.
+* If user approves, add to `rule_memory.json` or a training set to train a future layout model or to adjust solver weights.
+
+---
+
+## 9) Example run (pseudo-CLI)
+
+```bash
+python -c "from pipeline import pipeline_run; import json; d=json.load(open('room_detection.json')); print(pipeline_run(d,(400,300)))"
+```
+
+---
+
+## 10) Practical notes / caveats
+
+* LLMs can hallucinate numbers. Always validate returned numeric positions before using them.
+* Convert detector pixel coordinates → cm scale if you have a real dimension. If not, use relative room coordinates and scale later.
+* OR-Tools CP-SAT expects integer arithmetic; represent cm as integers.
+
+## RuleBook
+1. GLOBAL SYSTEM RULES
+
+JSON output only.
+
+Coordinates in centimeters.
+
+Room origin (0,0) = top-left.
+
+Furniture may never overlap, ever.
+
+Maintain logical human movement flows.
+
+Maintain consistent orientation + anchoring rules.
+
+Follow architectural, ergonomic, and interior design standards.
+
+2. WALKING & MOVEMENT CLEARANCE
+Mandatory clearances:
+
+Major walkways: 90–120 cm
+
+Side walkways: 60–90 cm
+
+Access around bed: 60–90 cm
+
+Front of wardrobe shelves: 110 cm minimum
+
+Never block:
+
+Doors
+
+Windows
+
+Balconies
+
+Power sockets
+
+AC vents
+
+3. DOOR RULES
+
+Keep 90 cm door swing radius completely free.
+
+No furniture inside the swing arc.
+
+No heavy furniture beside a door that restricts movement.
+
+Walkway from door → center of room = clear.
+
+4. WINDOW RULES
+
+Never block windows with furniture taller than 80 cm.
+
+Maintain 60–100 cm clearance for airflow.
+
+Desks should be near windows (ideal).
+
+Plants within 100 cm of windows.
+
+Bed should not block windows.
+
+TV should not face strong window glare.
+
+5. LIGHTING RULES
+
+Place work desks near natural light.
+
+Avoid placing mirrors that reflect harsh sunlight.
+
+Lamps should be placed:
+
+next to sofas
+
+next to chairs
+
+in room corners
+
+Ambient lighting zones should not be obstructed by tall furniture.
+
+6. POWER OUTLET RULES
+
+These are optional but great:
+
+TV should be near the wall with outlets (if detected).
+
+Bedside tables usually near outlets for lamps/charging.
+
+Desk should align with wall outlets.
+
+7. FURNITURE-SPECIFIC RULES
+7.1 Sofa Rules
+
+Must face the TV.
+
+Should anchor to a wall unless the room is huge.
+
+Back of sofa should have 60 cm clearance if floating.
+
+TV-viewing distance = 150–300 cm.
+
+TV must be horizontally aligned with sofa center.
+
+7.2 TV Rules
+
+Never place TV in front of strong sunlight.
+
+TV should be against a solid wall, not windows.
+
+Maintain correct viewing angle:
+
+Horizontal: 20–40°
+
+Vertical: 0–15°
+
+7.3 Bed Rules
+
+Bed must always anchor to a wall.
+
+Never float a bed in center.
+
+Should not block windows.
+
+Clearance on sides:
+
+Both-sides bed: 60–90 cm
+
+Single-side bed: 45–60 cm
+
+Avoid placing bed directly facing the door (optional feng-shui).
+
+7.4 Wardrobe Rules
+
+Always anchor to a wall.
+
+Needs 110–140 cm pull-out clearance.
+
+Should not face windows (glare).
+
+7.5 Work Desk Rules
+
+Prefer near windows (natural light).
+
+Should not block door walkways.
+
+Chair clearance behind desk: 100–120 cm minimum.
+
+7.6 Dining Table Rules
+
+90 cm minimum clearance all around.
+
+Must be centered in dining area zones if any.
+
+7.7 Mirror Rules
+
+Should be placed:
+
+near entryway
+
+behind sofa
+
+beside wardrobe
+
+NEVER floating randomly.
+
+Avoid placing mirrors facing bed (feng-shui).
+
+Avoid placing mirrors opposite strong sunlight.
+
+7.8 Plant Rules
+
+Within 100 cm of windows.
+
+In corners or by shelves.
+
+Never mid-walkway.
+
+7.9 Lamp Rules
+
+Beside sofa or chair.
+
+In dark corners.
+
+Near bed or desk.
+
+7.10 Shelf Rules
+
+Must anchor to wall.
+
+Should not block windows.
+
+8. ROOM TYPE SPECIAL RULES
+8.1 Living Room
+
+Sofa faces TV.
+
+Coffee table centered.
+
+Lamps flank sofa or corners.
+
+Plants by window.
+
+Maintain large square walkway.
+
+8.2 Bedroom
+
+Bed against wall.
+
+Wardrobe opposite bed or side wall.
+
+Desk near window.
+
+Mirror near wardrobe.
+
+Lamps near bedside.
+
+8.3 Study / Office
+
+Desk near natural light.
+
+Bookshelf anchored to long wall.
+
+Chair clearance at least 120 cm.
+
+9. ADVANCED SPATIAL RULES
+
+Maintain symmetry when possible.
+
+Prefer anchoring large items to longest wall.
+
+Use triangular arrangements for aesthetics:
+
+sofa → center table → TV
+
+Avoid cluttered corners.
+
+Keep center of room mostly open.
+
+Try to center arrangements with respect to wall geometry.
+
+Avoid blocking furniture lines of sight.
+
+10. SOLVER (OR-TOOLS) MUST ENFORCE
+
+Windsurf must implement:
+
+Rectangle non-overlap constraints.
+
+Door-radius avoidance (circle constraint).
+
+Window proximity avoidance.
+
+Bed must touch a wall.
+
+Wardrobe must touch a wall.
+
+Desk must be within 150 cm of a window if possible.
+
+Sofa must orient toward TV within 10 degrees tolerance.
+
+Minimum walkable-clearances everywhere.
+
+Keep inside boundaries.
+
+11. LLM MUST DO: SOFT LOGIC + PLANNING
+
+Windsurf should modify LLM prompt to include:
+
+Layout zones:
+
+“conversation zone”
+
+“resting zone”
+
+“work zone”
+
+JSON output only
+
+Suggested (x,y) + orientation
+
+High-level notes
+
+Soft positioning that solver will refine
+

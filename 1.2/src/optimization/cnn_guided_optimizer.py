@@ -159,6 +159,442 @@ class CNNGuidedOptimizer:
             random.seed(seed)
             np.random.seed(seed)
         self.diagnostics: List[Dict] = []
+
+        # Cache basic architectural primitives for constraint reasoning
+        self._room_w, self._room_h = self.room_dims
+        self._doors = self._extract_openings("door")
+        self._windows = self._extract_openings("window")
+        self._walls = self._extract_walls()
+
+    # ------------------------------------------------------------------
+    # Architectural helpers (doors, windows, walls)
+    # ------------------------------------------------------------------
+
+    def _extract_openings(self, kind: str) -> List[Dict]:
+        def _dtype(det: Dict) -> str:
+            return str(det.get("type") or det.get("label") or "").lower().replace("_", " ")
+        out: List[Dict] = []
+        for d in self.room_analysis.get("detections", []):
+            if _dtype(d) != kind:
+                continue
+            bb = d.get("room_bbox") or d.get("bbox")
+            if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                continue
+            x1, y1, x2, y2 = map(float, bb)
+            out.append({"type": kind, "bbox": [x1, y1, x2, y2]})
+        return out
+
+    def _extract_walls(self) -> List[Dict]:
+        """Return simple perimeter walls as line segments (top/bottom/left/right)."""
+        w, h = self.room_dims
+        return [
+            {"name": "left", "orientation": "vertical", "x1": 0.0, "y1": 0.0, "x2": 0.0, "y2": h},
+            {"name": "right", "orientation": "vertical", "x1": w, "y1": 0.0, "x2": w, "y2": h},
+            {"name": "top", "orientation": "horizontal", "x1": 0.0, "y1": 0.0, "x2": w, "y2": 0.0},
+            {"name": "bottom", "orientation": "horizontal", "x1": 0.0, "y1": h, "x2": w, "y2": h},
+        ]
+
+    # ------------------------------------------------------------------
+    # Wall selection / placement
+    # ------------------------------------------------------------------
+
+    def _wall_for_object(self, obj: Dict) -> Optional[Dict]:
+        cx = obj["x"] + obj["w"] / 2.0
+        cy = obj["y"] + obj["h"] / 2.0
+        w, h = self.room_dims
+        candidates = [
+            ("left", cx),
+            ("right", w - cx),
+            ("top", cy),
+            ("bottom", h - cy),
+        ]
+        name = min(candidates, key=lambda t: t[1])[0]
+        for wall in self._walls:
+            if wall["name"] == name:
+                return wall
+        return None
+
+    def find_best_wall(self, furniture: Dict, role: str, layout: List[Dict]) -> Dict:
+        """Choose the most appropriate perimeter wall for an anchored object."""
+        role_l = role.lower()
+        walls = self._walls
+
+        def length(wall: Dict) -> float:
+            return math.hypot(wall["x2"] - wall["x1"], wall["y2"] - wall["y1"])
+
+        def opposite(name: str) -> Optional[str]:
+            mapping = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
+            return mapping.get(name)
+
+        # If sofa has TV, sofa should be opposite TV and vice versa
+        if role_l == "sofa":
+            tvs = [o for o in layout if "tv" in o.get("type", "").lower()]
+            if tvs:
+                tv_wall = self._wall_for_object(tvs[0])
+                if tv_wall:
+                    opp = opposite(tv_wall["name"])
+                    for w in walls:
+                        if w["name"] == opp:
+                            return w
+        if role_l == "tv":
+            sofas = [o for o in layout if "sofa" in o.get("type", "").lower() or "couch" in o.get("type", "").lower()]
+            if sofas:
+                sofa_wall = self._wall_for_object(sofas[0])
+                if sofa_wall:
+                    opp = opposite(sofa_wall["name"])
+                    for w in walls:
+                        if w["name"] == opp:
+                            return w
+
+        # Fallback: longest wall for sofa/bed; otherwise nearest to corners
+        if role_l in {"sofa", "bed"}:
+            return max(walls, key=length)
+        return max(walls, key=length)
+
+    def place_against_wall(self, obj: Dict, wall: Dict, layout: List[Dict], margin: float = 5.0) -> Optional[Tuple[float, float]]:
+        """Snap an object to a wall while keeping overlaps and door swing clear."""
+        room_w, room_h = self.room_dims
+        w, h = float(obj.get("w", 0.0)), float(obj.get("h", 0.0))
+        if w <= 0 or h <= 0:
+            return None
+
+        candidates: List[Tuple[float, float]] = []
+        step = max(10.0, min(w, h) / 2.0)
+
+        if wall["orientation"] == "horizontal":
+            # top or bottom
+            if wall["y1"] < room_h / 2.0:
+                y = margin
+            else:
+                y = room_h - h - margin
+            x = margin
+            while x + w + margin <= room_w + 1e-6:
+                candidates.append((x, y))
+                x += step
+        else:
+            # left or right
+            if wall["x1"] < room_w / 2.0:
+                x = margin
+            else:
+                x = room_w - w - margin
+            y = margin
+            while y + h + margin <= room_h + 1e-6:
+                candidates.append((x, y))
+                y += step
+
+        best: Optional[Tuple[float, float]] = None
+        for (cx, cy) in candidates:
+            test = dict(obj)
+            test.update({"x": cx, "y": cy})
+            if any(self._overlap(test, other) for other in layout):
+                continue
+            if not self.check_door_clearance(test):
+                continue
+            best = (cx, cy)
+            break
+        return best
+
+    # ------------------------------------------------------------------
+    # Core hard constraints used by the deterministic solver
+    # ------------------------------------------------------------------
+
+    def check_door_clearance(self, obj: Dict) -> bool:
+        """No object intersects door polygon or 90cm swing path."""
+        if not self._doors:
+            return True
+        x1, y1 = obj["x"], obj["y"]
+        x2, y2 = x1 + obj["w"], y1 + obj["h"]
+        for door in self._doors:
+            dx1, dy1, dx2, dy2 = door["bbox"]
+            px_w = abs(dx2 - dx1)
+            px_h = abs(dy2 - dy1)
+            swing = max(90.0, float(min(px_w, px_h)))
+            expand = 20.0
+            crx1 = min(dx1, dx2) - expand
+            cry1 = min(dy1, dy2) - expand
+            crx2 = max(dx1, dx2) + expand + swing
+            cry2 = max(dy1, dy2) + expand + swing
+            if not (x2 <= crx1 or x1 >= crx2 or y2 <= cry1 or y1 >= cry2):
+                return False
+        return True
+
+    def check_window_blocking(self, obj: Dict) -> bool:
+        """Sofa/wardrobe/bookcase must not block windows; desk/plant should be near."""
+        t = obj.get("type", "").lower().replace("_", " ")
+        if not self._windows:
+            return True
+        x1, y1 = obj["x"], obj["y"]
+        x2, y2 = x1 + obj["w"], y1 + obj["h"]
+
+        def overlap(a, b) -> float:
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                return 0.0
+            return (ix2 - ix1) * (iy2 - iy1)
+
+        for win in self._windows:
+            wx1, wy1, wx2, wy2 = win["bbox"]
+            if t in {"sofa", "wardrobe", "bookcase", "bookshelf"}:
+                if overlap((x1, y1, x2, y2), (wx1, wy1, wx2, wy2)) > 0:
+                    return False
+            if t in {"desk", "plant", "small plant", "large plant"}:
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                wcx = (wx1 + wx2) / 2.0
+                wcy = (wy1 + wy2) / 2.0
+                if math.hypot(cx - wcx, cy - wcy) > 100.0 + 1e-6:
+                    # Not hard failure – GA will still prefer closer placements –
+                    # but the deterministic solver uses this as a filter.
+                    return False
+        return True
+
+    def route_path_clearance(self, obj: Dict, layout: List[Dict], min_width: float = 80.0) -> bool:
+        """Approximate navmesh: ensure door→center path keeps min corridor width."""
+        if not self._doors:
+            return True
+        w, h = self.room_dims
+        cx, cy = w / 2.0, h / 2.0
+        res = 5.0
+        gw, gh = int(max(1, round(w / res))), int(max(1, round(h / res)))
+        occ = np.zeros((gh, gw), dtype=np.uint8)
+
+        def mark(o: Dict) -> None:
+            x1 = int(max(0, math.floor(o["x"] / res)))
+            y1 = int(max(0, math.floor(o["y"] / res)))
+            x2 = int(min(gw - 1, math.ceil((o["x"] + o["w"]) / res)))
+            y2 = int(min(gh - 1, math.ceil((o["y"] + o["h"]) / res)))
+            occ[y1:y2, x1:x2] = 255
+
+        for o in layout:
+            if o.get("fixed") or o.get("architectural"):
+                continue
+            mark(o)
+        mark(obj)
+
+        inv = (occ == 0).astype(np.uint8) * 255
+        dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3) * res
+
+        for door in self._doors:
+            dx1, dy1, dx2, dy2 = door["bbox"]
+            dxc, dyc = (dx1 + dx2) / 2.0, (dy1 + dy2) / 2.0
+            N = 80
+            min_clear = float("inf")
+            for t in np.linspace(0.0, 1.0, N):
+                px = dxc * (1 - t) + cx * t
+                py = dyc * (1 - t) + cy * t
+                gx = int(min(gw - 1, max(0, round(px / res))))
+                gy = int(min(gh - 1, max(0, round(py / res))))
+                min_clear = min(min_clear, float(dist[gy, gx]))
+            if min_clear < min_width - 1e-6:
+                return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Functional zones and deterministic constraint solver
+    # ------------------------------------------------------------------
+
+    def find_functional_zones(self) -> Dict[str, Dict]:
+        """Create coarse functional zones for living, reading, work, green, entry, storage."""
+        w, h = self.room_dims
+        zones: Dict[str, Dict] = {}
+
+        # Entry near first door if available
+        if self._doors:
+            dx1, dy1, dx2, dy2 = self._doors[0]["bbox"]
+            dxc, dyc = (dx1 + dx2) / 2.0, (dy1 + dy2) / 2.0
+            zw, zh = w * 0.3, h * 0.3
+            ex1 = max(0.0, dxc - zw / 2.0)
+            ey1 = max(0.0, dyc - zh / 2.0)
+            ex2 = min(w, ex1 + zw)
+            ey2 = min(h, ey1 + zh)
+            zones["entry"] = {"name": "entry", "bbox": [ex1, ey1, ex2, ey2], "center": [(ex1 + ex2) / 2.0, (ey1 + ey2) / 2.0], "size": [ex2 - ex1, ey2 - ey1], "members": []}
+
+        # Living zone in the central band
+        lv_w, lv_h = w * 0.6, h * 0.5
+        lx1 = (w - lv_w) / 2.0
+        ly1 = (h - lv_h) / 2.0
+        lx2, ly2 = lx1 + lv_w, ly1 + lv_h
+        zones["living"] = {"name": "living", "bbox": [lx1, ly1, lx2, ly2], "center": [(lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0], "size": [lv_w, lv_h], "members": []}
+
+        # Reading zone in a back corner
+        rz_w, rz_h = w * 0.35, h * 0.35
+        rx1 = w - rz_w - 10.0
+        ry1 = h - rz_h - 10.0
+        rx2, ry2 = rx1 + rz_w, ry1 + rz_h
+        zones["reading"] = {"name": "reading", "bbox": [rx1, ry1, rx2, ry2], "center": [(rx1 + rx2) / 2.0, (ry1 + ry2) / 2.0], "size": [rz_w, rz_h], "members": []}
+
+        # Work and green zones near first window if available
+        if self._windows:
+            wx1, wy1, wx2, wy2 = self._windows[0]["bbox"]
+            wcx, wcy = (wx1 + wx2) / 2.0, (wy1 + wy2) / 2.0
+            wz_w, wz_h = w * 0.4, h * 0.4
+            bx1 = max(0.0, wcx - wz_w / 2.0)
+            by1 = max(0.0, wcy - wz_h / 2.0)
+            bx2 = min(w, bx1 + wz_w)
+            by2 = min(h, by1 + wz_h)
+            zones["work"] = {"name": "work", "bbox": [bx1, by1, bx2, by2], "center": [(bx1 + bx2) / 2.0, (by1 + by2) / 2.0], "size": [bx2 - bx1, by2 - by1], "members": []}
+
+            gz_w, gz_h = wz_w * 0.6, wz_h * 0.6
+            gx1 = max(0.0, wcx - gz_w / 2.0)
+            gy1 = max(0.0, wcy + 10.0)
+            gx2 = min(w, gx1 + gz_w)
+            gy2 = min(h, gy1 + gz_h)
+            zones["green"] = {"name": "green", "bbox": [gx1, gy1, gx2, gy2], "center": [(gx1 + gx2) / 2.0, (gy1 + gy2) / 2.0], "size": [gx2 - gx1, gy2 - gy1], "members": []}
+
+        # Storage band along one long wall
+        sz_w, sz_h = w * 0.25, h * 0.9
+        sx1, sy1 = w - sz_w - 5.0, 5.0
+        sx2, sy2 = sx1 + sz_w, sy1 + sz_h
+        zones["storage"] = {"name": "storage", "bbox": [sx1, sy1, sx2, sy2], "center": [(sx1 + sx2) / 2.0, (sy1 + sy2) / 2.0], "size": [sz_w, sz_h], "members": []}
+
+        return zones
+
+    def run_constraint_solver(self) -> List[Dict]:
+        """Deterministic layout used to seed the GA instead of random placement."""
+        if not self.base_objects:
+            return []
+
+        layout: List[Dict] = []
+        zones = self.find_functional_zones()
+
+        def T(o: Dict) -> str:
+            return o.get("type", "").lower().replace("_", " ")
+
+        # --- Step 1: anchor wall objects (sofa, bed, wardrobe, tv, bookshelf, mirror, desk) ---
+        wall_candidates: List[Dict] = []
+        for o in self.base_objects:
+            t = T(o)
+            if any(k in t for k in ["sofa", "bed", "wardrobe", "bookcase", "bookshelf", "tv", "mirror", "desk"]):
+                wall_candidates.append(o)
+
+        # TV first
+        for o in wall_candidates:
+            if "tv" in T(o):
+                wall = self.find_best_wall(o, "tv", layout)
+                pos = self.place_against_wall(o, wall, layout)
+                if pos is not None:
+                    o["x"], o["y"] = pos
+                    layout.append(dict(o))
+
+        # Sofa next
+        for o in wall_candidates:
+            if "sofa" in T(o) or "couch" in T(o):
+                wall = self.find_best_wall(o, "sofa", layout)
+                pos = self.place_against_wall(o, wall, layout)
+                if pos is not None:
+                    o["x"], o["y"] = pos
+                    layout.append(dict(o))
+                    if "living" in zones:
+                        zones["living"]["members"].append(o)
+
+        # Bed headboard
+        for o in wall_candidates:
+            if "bed" in T(o):
+                wall = self.find_best_wall(o, "bed", layout)
+                pos = self.place_against_wall(o, wall, layout)
+                if pos is not None:
+                    o["x"], o["y"] = pos
+                    layout.append(dict(o))
+
+        # Remaining wall storage (wardrobe, bookshelf, desk, mirror)
+        for o in wall_candidates:
+            if any(x in T(o) for x in ["wardrobe", "bookcase", "bookshelf", "desk", "mirror"]):
+                if any(o is placed for placed in layout):
+                    # Already added above
+                    continue
+                wall = self.find_best_wall(o, "storage", layout)
+                pos = self.place_against_wall(o, wall, layout)
+                if pos is not None:
+                    o["x"], o["y"] = pos
+                    layout.append(dict(o))
+                    if "storage" in zones:
+                        zones["storage"]["members"].append(o)
+
+        # --- Step 2: assign remaining furniture into functional zones ---
+        for o in self.base_objects:
+            if any(self._overlap(o, placed) for placed in layout):
+                continue
+            t = T(o)
+            if any(k in t for k in ["coffee table", "center table"]):
+                zones.get("living", zones[next(iter(zones))])["members"].append(o)
+            elif any(k in t for k in ["armchair", "accent chair", "reading chair"]):
+                zones.get("reading", zones.get("living", list(zones.values())[0]))["members"].append(o)
+            elif "desk" in t:
+                zones.get("work", zones.get("living", list(zones.values())[0]))["members"].append(o)
+            elif "lamp" in t:
+                zones.get("reading", zones.get("living", list(zones.values())[0]))["members"].append(o)
+            elif "plant" in t:
+                zones.get("green", zones.get("living", list(zones.values())[0]))["members"].append(o)
+            else:
+                zones.get("living", list(zones.values())[0])["members"].append(o)
+
+        # --- Step 3: place loose objects inside zones with simple grid packing ---
+        placed_ids = {id(o) for o in layout}
+        for z in zones.values():
+            x1, y1, x2, y2 = z["bbox"]
+            zw, zh = x2 - x1, y2 - y1
+            if zw <= 0 or zh <= 0:
+                continue
+            cursor_x = x1 + 10.0
+            cursor_y = y1 + 10.0
+            row_h = 0.0
+            for o in z.get("members", []):
+                if id(o) in placed_ids:
+                    continue
+                wobj = float(o.get("w", 0.0))
+                hobj = float(o.get("h", 0.0))
+                if wobj <= 0 or hobj <= 0:
+                    continue
+                if cursor_x + wobj + 10.0 > x2:
+                    cursor_x = x1 + 10.0
+                    cursor_y += row_h + 15.0
+                    row_h = 0.0
+                if cursor_y + hobj + 10.0 > y2:
+                    continue
+                trial = dict(o)
+                trial.update({"x": cursor_x, "y": cursor_y})
+                if any(self._overlap(trial, other) for other in layout):
+                    continue
+                if not self.check_door_clearance(trial):
+                    continue
+                if not self.check_window_blocking(trial):
+                    continue
+                if not self.route_path_clearance(trial, layout):
+                    continue
+                o["x"], o["y"] = cursor_x, cursor_y
+                layout.append(dict(o))
+                placed_ids.add(id(o))
+                cursor_x += wobj + 15.0
+                row_h = max(row_h, hobj)
+
+        # Any still-unplaced objects: drop into free space with constraints
+        for o in self.base_objects:
+            if id(o) in placed_ids:
+                continue
+            wobj = float(o.get("w", 0.0))
+            hobj = float(o.get("h", 0.0))
+            if wobj <= 0 or hobj <= 0:
+                continue
+            for _ in range(40):
+                x = random.uniform(0, max(1.0, self._room_w - wobj))
+                y = random.uniform(0, max(1.0, self._room_h - hobj))
+                trial = dict(o)
+                trial.update({"x": x, "y": y})
+                if any(self._overlap(trial, other) for other in layout):
+                    continue
+                if not self.check_door_clearance(trial):
+                    continue
+                if not self.route_path_clearance(trial, layout):
+                    continue
+                o["x"], o["y"] = x, y
+                layout.append(dict(o))
+                placed_ids.add(id(o))
+                break
+
+        return layout
     
     def cnn_guided_fitness(self, layout: List[Dict]) -> float:
         """
@@ -670,98 +1106,62 @@ class CNNGuidedOptimizer:
         return groups
     
     def optimize(self) -> List[Dict]:
-        """Main optimization loop with CNN guidance."""
+        """Main optimization loop: deterministic constraint solver + GA refinement.
+
+        1. Use run_constraint_solver() to build an architecturally sensible base layout.
+        2. Seed a GA population with small perturbations of that layout.
+        3. Refine using cnn_guided_fitness (which already encodes many soft rules).
+        4. Run final validation passes; if any hard validation fails, re-run solver
+           with a few attempts before returning.
+        """
         # Safety check: ensure we have furniture to place
         if not self.base_objects:
             print("[WARNING] No furniture objects provided. Returning empty layout with architectural elements only.")
             return self._add_architectural_elements([])
-        
-        # Initialize population with CNN guidance
-        population = []
-        for _ in range(self.population_size):
-            layout = self._cnn_guided_initialization()
-            if layout:  # Only add non-empty layouts
-                population.append(layout)
-        
-        # Safety check: ensure we have at least one valid layout
-        if not population:
-            print("[ERROR] Failed to initialize any valid layouts. Creating fallback layout.")
-            # Create a simple fallback layout with minimal placement
-            fallback_layout = []
-            for obj in self.base_objects:
-                test_obj = dict(obj)
-                test_obj.update({
-                    "x": random.uniform(0, max(1.0, self.room_dims[0] - obj["w"])),
-                    "y": random.uniform(0, max(1.0, self.room_dims[1] - obj["h"]))
-                })
-                fallback_layout.append(test_obj)
-            population = [fallback_layout]
-        
-        best_so_far = deepcopy(population[0])  # Initialize with first layout
+
+        base_layout = self.run_constraint_solver()
+        if not base_layout:
+            print("[ERROR] Constraint solver produced empty layout, falling back to legacy initializer.")
+            base_layout = self._cnn_guided_initialization()
+
+        # Initialize population around base layout (small mutations only)
+        population: List[List[Dict]] = [deepcopy(base_layout)]
+        while len(population) < self.population_size:
+            mutated = self.cnn_guided_mutation(deepcopy(base_layout), mutation_rate=0.15)
+            population.append(mutated)
+
+        best_so_far = deepcopy(base_layout)
         best_score = self.cnn_guided_fitness(best_so_far)
-        
-        for generation in range(self.generations):
-            # Calculate fitness scores
+
+        for _ in range(self.generations):
             scores = [self.cnn_guided_fitness(ind) for ind in population]
-            
-            # Track best
             gen_best_idx = int(np.argmax(scores))
             if scores[gen_best_idx] > best_score:
                 best_score = scores[gen_best_idx]
                 best_so_far = deepcopy(population[gen_best_idx])
-            
-            # Elitism: keep top 3
+
             idx_sorted = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
             elites = [deepcopy(population[i]) for i in idx_sorted[:3]]
-            
-            # Selection and reproduction
+
             new_population = elites.copy()
-            
             while len(new_population) < self.population_size:
-                # Tournament selection
                 parent1 = self._tournament_select(population, scores, k=3)
                 parent2 = self._tournament_select(population, scores, k=3)
-                
-                # Crossover
                 child = self.cnn_guided_crossover(parent1, parent2)
-                
-                # Mutation
-                child = self.cnn_guided_mutation(child, mutation_rate=0.3)
-                
+                child = self.cnn_guided_mutation(child, mutation_rate=0.25)
                 new_population.append(child)
-            
             population = new_population
-        
-        # Safety check before final cleanup
-        if not best_so_far:
-            print("[ERROR] No valid solution found. Returning fallback layout.")
-            best_so_far = []
-            for obj in self.base_objects:
-                test_obj = dict(obj)
-                test_obj.update({
-                    "x": random.uniform(0, max(1.0, self.room_dims[0] - obj["w"])),
-                    "y": random.uniform(0, max(1.0, self.room_dims[1] - obj["h"]))
-                })
-                best_so_far.append(test_obj)
-        
-        # Final cleanup
-        for obj in best_so_far:
-            obj["x"] = float(max(0.0, min(self.room_dims[0] - obj["w"], obj["x"])))
-            obj["y"] = float(max(0.0, min(self.room_dims[1] - obj["h"], obj["y"])))
-        
-        # Final repair
-        if self._has_overlaps(best_so_far):
-            best_so_far = self._repair_layout(best_so_far)
-        
+
+        # Final validation & repair loop
+        best_valid = self._validate_and_repair(best_so_far)
+
         # Include architectural elements in output
-        best_so_far = self._add_architectural_elements(best_so_far)
-        # Collect diagnostics for final layout
+        best_valid = self._add_architectural_elements(best_valid)
         try:
-            self.diagnostics = self._collect_diagnostics(best_so_far)
+            self.diagnostics = self._collect_diagnostics(best_valid)
         except Exception:
             self.diagnostics = []
-        
-        return best_so_far
+        return best_valid
     
     def optimize_multiple(self, count: int = 3) -> List[Dict]:
         """Generate multiple alternative layouts for user selection."""
@@ -815,69 +1215,19 @@ class CNNGuidedOptimizer:
         return enhanced_layout
     
     def _cnn_guided_initialization(self) -> List[Dict]:
-        """Initialize layout using CNN guidance. ENSURES ALL FURNITURE IS PLACED."""
-        layout = []
-        placed_objects = set()
-        
-        # Sort objects by importance (size and type)
-        sorted_objects = sorted(enumerate(self.base_objects), 
-                               key=lambda x: x[1]["w"] * x[1]["h"], reverse=True)
-        
-        for orig_idx, obj in sorted_objects:
-            if orig_idx in placed_objects:
-                continue
-            
-            furniture_type = obj.get("type", "").lower().replace("_", " ")
-            guidance = self.guidance_system.get_placement_guidance(furniture_type)
-            
-            # Try to place in preferred zones first
-            placed = False
-            for zone in guidance["preferred_zones"]:
-                if self._try_place_in_zone(obj, zone, layout):
-                    layout.append(obj)
-                    placed_objects.add(orig_idx)
-                    placed = True
-                    break
-            
-            # Fallback to random placement with more attempts
-            if not placed:
-                for attempt in range(100):
-                    x = random.uniform(0, max(1.0, self.room_dims[0] - obj["w"]))
-                    y = random.uniform(0, max(1.0, self.room_dims[1] - obj["h"]))
-                    
-                    test_obj = dict(obj)
-                    test_obj.update({"x": x, "y": y})
-                    
-                    if not any(self._overlap(test_obj, existing) for existing in layout):
-                        layout.append(test_obj)
-                        placed_objects.add(orig_idx)
-                        placed = True
-                        break
-            
-            # CRITICAL: Check if furniture is too large for room before forcing placement
-            if not placed:
-                furniture_area = obj["w"] * obj["h"]
-                room_area = self.room_dims[0] * self.room_dims[1]
-                
-                # If furniture takes up more than 60% of room, skip it
-                if furniture_area > room_area * 0.6:
-                    print(f"[WARNING] Skipping {obj.get('type', 'unknown')} - too large for room ({furniture_area:.0f}cm² vs {room_area:.0f}cm² room)")
-                    continue
-                
-                # Force placement with overlap (will be repaired by genetic algorithm)
-                print(f"[WARNING] Could not place {obj.get('type', 'unknown')} without overlap. Forcing placement.")
+        """Initialize layout using deterministic constraint solver instead of random placement."""
+        layout = self.run_constraint_solver()
+        if not layout:
+            # Fallback to previous random behavior if solver fails
+            fallback: List[Dict] = []
+            for obj in self.base_objects:
                 test_obj = dict(obj)
                 test_obj.update({
                     "x": random.uniform(0, max(1.0, self.room_dims[0] - obj["w"])),
                     "y": random.uniform(0, max(1.0, self.room_dims[1] - obj["h"]))
                 })
-                layout.append(test_obj)
-                placed_objects.add(orig_idx)
-        
-        # Verify all objects were placed
-        if len(layout) != len(self.base_objects):
-            print(f"[ERROR] Only placed {len(layout)}/{len(self.base_objects)} objects!")
-        
+                fallback.append(test_obj)
+            layout = fallback
         return layout
     
     def _try_place_in_zone(self, obj: Dict, zone: Dict, existing_layout: List[Dict]) -> bool:
@@ -1064,3 +1414,205 @@ class CNNGuidedOptimizer:
                     "offenders": offenders
                 })
         return diags
+
+    # ------------------------------------------------------------------
+    # Final validation helpers
+    # ------------------------------------------------------------------
+
+    def _validate_and_repair(self, layout: List[Dict]) -> List[Dict]:
+        """Run final hard validations and, if necessary, try limited re-solve.
+
+        Validation set:
+        - validate_no_door_obstruction
+        - validate_walk_path
+        - validate_window_access
+        - validate_alignment
+        - validate_lighting_rules
+        """
+        candidate = deepcopy(layout)
+
+        def _ok(L: List[Dict]) -> bool:
+            try:
+                return (
+                    self.validate_no_door_obstruction(L)
+                    and self.validate_walk_path(L)
+                    and self.validate_window_access(L)
+                    and self.validate_alignment(L)
+                    and self.validate_lighting_rules(L)
+                )
+            except Exception:
+                # Fail open rather than crashing the pipeline
+                return True
+
+        # First, make sure we don't keep layouts with simple overlaps
+        try:
+            if self._has_overlaps(candidate):
+                candidate = self._repair_layout(candidate)
+        except Exception:
+            pass
+
+        if _ok(candidate) and not self._has_overlaps(candidate):
+            return candidate
+
+        # Try basic overlap-based repair once
+        try:
+            candidate = self._repair_layout(candidate)
+        except Exception:
+            pass
+        try:
+            if _ok(candidate) and not self._has_overlaps(candidate):
+                return candidate
+        except Exception:
+            if _ok(candidate):
+                return candidate
+
+        # As a last resort, re-run deterministic solver a few times
+        for _ in range(3):
+            try:
+                candidate = self.run_constraint_solver()
+            except Exception:
+                candidate = []
+            if candidate and _ok(candidate) and not self._has_overlaps(candidate):
+                return candidate
+        # Fall back to the best we have, but prefer non-overlapping layout
+        try:
+            if candidate and not self._has_overlaps(candidate):
+                return candidate
+        except Exception:
+            if candidate:
+                return candidate
+        return layout
+
+    def validate_no_door_obstruction(self, layout: List[Dict]) -> bool:
+        """Ensure movable furniture does not violate door swing clearance."""
+        try:
+            for o in layout:
+                if o.get("fixed") or o.get("architectural"):
+                    continue
+                if not self.check_door_clearance(o):
+                    return False
+            return True
+        except Exception:
+            return True
+
+    def validate_walk_path(self, layout: List[Dict]) -> bool:
+        """Ensure each door has a reasonably clear path to room center."""
+        try:
+            if not self._doors:
+                return True
+            room_w, room_h = self.room_dims
+            res = 5.0
+            gw, gh = int(max(1, round(room_w / res))), int(max(1, round(room_h / res)))
+            occ = np.zeros((gh, gw), dtype=np.uint8)
+            for o in layout:
+                if o.get("fixed") or o.get("architectural"):
+                    continue
+                x1 = int(max(0, math.floor(o["x"] / res)))
+                y1 = int(max(0, math.floor(o["y"] / res)))
+                x2 = int(min(gw - 1, math.ceil((o["x"] + o["w"]) / res)))
+                y2 = int(min(gh - 1, math.ceil((o["y"] + o["h"]) / res)))
+                occ[y1:y2, x1:x2] = 255
+            inv = (occ == 0).astype(np.uint8) * 255
+            dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3) * res
+            cx, cy = room_w / 2.0, room_h / 2.0
+            for door in self._doors:
+                dx1, dy1, dx2, dy2 = door["bbox"]
+                dxc, dyc = (dx1 + dx2) / 2.0, (dy1 + dy2) / 2.0
+                N = 80
+                min_clear = float("inf")
+                for t in np.linspace(0.0, 1.0, N):
+                    px = dxc * (1 - t) + cx * t
+                    py = dyc * (1 - t) + cy * t
+                    gx = int(min(gw - 1, max(0, round(px / res))))
+                    gy = int(min(gh - 1, max(0, round(py / res))))
+                    min_clear = min(min_clear, float(dist[gy, gx]))
+                if min_clear < 80.0 - 1e-6:
+                    return False
+            return True
+        except Exception:
+            return True
+
+    def validate_window_access(self, layout: List[Dict]) -> bool:
+        """Ensure large furniture does not block window apertures excessively."""
+        try:
+            if not self._windows:
+                return True
+
+            def rect_overlap(a, b) -> float:
+                ax1, ay1, ax2, ay2 = a
+                bx1, by1, bx2, by2 = b
+                ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+                ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+                if ix2 <= ix1 or iy2 <= iy1:
+                    return 0.0
+                return (ix2 - ix1) * (iy2 - iy1)
+
+            for win in self._windows:
+                wb = win["bbox"]
+                warea = max(0.0, (wb[2] - wb[0]) * (wb[3] - wb[1]))
+                if warea <= 0:
+                    continue
+                blocked = 0.0
+                for o in layout:
+                    if o.get("fixed") or o.get("architectural"):
+                        continue
+                    ob = (o["x"], o["y"], o["x"] + o["w"], o["y"] + o["h"])
+                    blocked += rect_overlap(ob, wb)
+                pct = 100.0 * blocked / warea if warea > 0 else 0.0
+                if pct > 35.0:
+                    return False
+            return True
+        except Exception:
+            return True
+
+    def validate_alignment(self, layout: List[Dict]) -> bool:
+        """Light-weight checks for basic alignment rules (sofa↔TV, bed↔wall)."""
+        try:
+            sofas = [o for o in layout if "sofa" in o.get("type", "").lower() or "couch" in o.get("type", "").lower()]
+            tvs = [o for o in layout if "tv" in o.get("type", "").lower()]
+            if sofas and tvs:
+                s = sofas[0]
+                t = tvs[0]
+                scx = s["x"] + s["w"] / 2.0
+                tcx = t["x"] + t["w"] / 2.0
+                scy = s["y"] + s["h"] / 2.0
+                tcy = t["y"] + t["h"] / 2.0
+                align_err = min(abs(scx - tcx), abs(scy - tcy))
+                if align_err > 120.0:
+                    return False
+            # Bed near at least one wall
+            beds = [o for o in layout if "bed" in o.get("type", "").lower()]
+            for b in beds:
+                dmin = min(b["x"], b["y"], self.room_dims[0] - (b["x"] + b["w"]), self.room_dims[1] - (b["y"] + b["h"]))
+                if dmin > 80.0:
+                    return False
+            return True
+        except Exception:
+            return True
+
+    def validate_lighting_rules(self, layout: List[Dict]) -> bool:
+        """Ensure desks and chairs have at least one nearby window or lamp."""
+        try:
+            lights = [o for o in layout if any(k in o.get("type", "").lower() for k in ["lamp", "chandelier", "pendant", "sconce"])]
+            for o in layout:
+                t = o.get("type", "").lower().replace("_", " ")
+                if t not in {"desk", "chair", "office chair", "dining chair"}:
+                    continue
+                cx = o["x"] + o["w"] / 2.0
+                cy = o["y"] + o["h"] / 2.0
+                best = float("inf")
+                for win in self._windows:
+                    wx1, wy1, wx2, wy2 = win["bbox"]
+                    wcx, wcy = (wx1 + wx2) / 2.0, (wy1 + wy2) / 2.0
+                    best = min(best, math.hypot(cx - wcx, cy - wcy))
+                for l in lights:
+                    lx = l["x"] + l["w"] / 2.0
+                    ly = l["y"] + l["h"] / 2.0
+                    best = min(best, math.hypot(cx - lx, cy - ly))
+                if best == float("inf"):
+                    continue
+                if best > 180.0:
+                    return False
+            return True
+        except Exception:
+            return True

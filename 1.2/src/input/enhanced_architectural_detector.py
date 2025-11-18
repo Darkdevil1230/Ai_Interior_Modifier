@@ -78,13 +78,47 @@ class EnhancedArchitecturalDetector:
         doors = self._detect_doors(img_rgb, depth, vlm)
         lighting = self._analyze_lighting(img_rgb, vlm)
 
+        # Build unified detections list (image pixel coordinates)
+        detected = []
+        for src_key, t in (("windows", "window"), ("doors", "door")):
+            for obj in (vlm.get(src_key) or []):
+                try:
+                    if all(k in obj for k in ("x", "y", "width", "height")):
+                        x = float(obj["x"]); y = float(obj["y"])
+                        w = float(obj["width"]); h = float(obj["height"])
+                        cx = x + w / 2.0
+                        cy = y + h / 2.0
+                        detected.append({
+                            "type": t,
+                            "bbox": [x, y, x + w, y + h],
+                            "center": [cx, cy],
+                            "confidence": float(obj.get("confidence", 0.8)),
+                        })
+                except Exception:
+                    continue
+
+        # Depth summary for downstream use
+        depth_summary = None
+        if depth is not None:
+            try:
+                dmin = float(depth.min())
+                dmax = float(depth.max())
+                dmean = float(depth.mean())
+                depth_summary = {"min": dmin, "max": dmax, "mean": dmean}
+            except Exception:
+                depth_summary = None
+
         return {
             "room_type": vlm.get("room_type", "unknown"),
             "walls": walls,
             "windows": windows,
             "doors": doors,
             "lighting": lighting,
-            # Optionally infer approximate room dims later in pipeline
+            # Unified detection schema for downstream pipeline
+            "detected": detected,
+            "depth_map": depth,
+            "depth_map_summary": depth_summary,
+            "vlm_description": vlm,
         }
 
     def _get_depth(self, img_rgb: np.ndarray) -> Optional[np.ndarray]:
