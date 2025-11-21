@@ -781,6 +781,8 @@ class CNNGuidedOptimizer:
         office_chairs = [o for o in layout if "office chair" in T(o)]
         dining_chairs = [o for o in layout if "dining chair" in T(o)]
         any_chairs = [o for o in layout if "chair" in T(o)]
+        wardrobes = [o for o in layout if ("wardrobe" in T(o) or "closet" in T(o))]
+        plants = [o for o in layout if ("plant" in T(o) or "vase" in T(o))]
 
         windows = [d for d in self.room_analysis.get("detections", []) if _dtype(d) == "window"]
         def _nearest_window_dist(cx: float, cy: float) -> float:
@@ -847,13 +849,33 @@ class CNNGuidedOptimizer:
                 if d > 120.0:
                     penalty += (d - 120.0) * 15.0
 
+        # Beds: strongly prefer being anchored to a wall (headboard or side)
         for b in beds:
-            if self._min_wall_distance(b) > 30.0:
-                penalty += 8000.0
+            d_wall = self._min_wall_distance(b)
+            if d_wall > 5.0:  # >5cm away from any wall -> heavy penalty
+                penalty += (d_wall - 5.0) * 400.0
             if nightstands:
                 ns_d = min(math.hypot(self._center(n)[0] - self._center(b)[0], self._center(n)[1] - self._center(b)[1]) for n in nightstands) if nightstands else float("inf")
                 if ns_d > 100.0:
                     penalty += (ns_d - 100.0) * 20.0
+
+            # Maintain comfortable clearance between bed and wardrobes
+            for wrob in wardrobes:
+                # Approximate edge-to-edge distance along the shortest axis
+                bx1, by1 = b["x"], b["y"]
+                bx2, by2 = bx1 + b["w"], by1 + b["h"]
+                wx1, wy1 = wrob["x"], wrob["y"]
+                wx2, wy2 = wx1 + wrob["w"], wy1 + wrob["h"]
+                # Horizontal gap if aligned vertically
+                gap_x1 = max(0.0, wx1 - bx2)
+                gap_x2 = max(0.0, bx1 - wx2)
+                # Vertical gap if aligned horizontally
+                gap_y1 = max(0.0, wy1 - by2)
+                gap_y2 = max(0.0, by1 - wy2)
+                edge_gap = min(g for g in [gap_x1, gap_x2, gap_y1, gap_y2] if g > 0) if any(g > 0 for g in [gap_x1, gap_x2, gap_y1, gap_y2]) else 0.0
+                min_bed_wardrobe_gap = 60.0  # cm
+                if edge_gap < min_bed_wardrobe_gap:
+                    penalty += (min_bed_wardrobe_gap - edge_gap) * 150.0
 
         for f in fridges:
             if self._min_wall_distance(f) > 20.0:
@@ -882,6 +904,114 @@ class CNNGuidedOptimizer:
                 d = math.hypot(self._center(dsk)[0] - self._center(oc)[0], self._center(dsk)[1] - self._center(oc)[1])
                 if d > 80.0:
                     penalty += (d - 80.0) * 20.0
+
+        # Ottomans: keep comfortable clearance from sofas (avoid being jammed)
+        ottomans = [o for o in layout if "ottoman" in T(o)]
+        min_clearance = 40.0  # cm between sofa and ottoman centers
+        for s in sofas:
+            scx, scy = self._center(s)
+            for ot in ottomans:
+                ocx, ocy = self._center(ot)
+                d = math.hypot(scx - ocx, scy - ocy)
+                if d < min_clearance:
+                    penalty += (min_clearance - d) * 200.0
+
+        # Sofa vs wardrobes/bookcases: avoid jamming storage right against seating
+        storage_blocks = wardrobes + [o for o in layout if any(k in T(o) for k in ["bookcase", "bookshelf", "cabinet"])]
+        min_sofa_storage_gap = 50.0
+        for s in sofas:
+            sx1, sy1 = s["x"], s["y"]
+            sx2, sy2 = sx1 + s["w"], sy1 + s["h"]
+            for st in storage_blocks:
+                tx1, ty1 = st["x"], st["y"]
+                tx2, ty2 = tx1 + st["w"], ty1 + st["h"]
+                gap_x1 = max(0.0, tx1 - sx2)
+                gap_x2 = max(0.0, sx1 - tx2)
+                gap_y1 = max(0.0, ty1 - sy2)
+                gap_y2 = max(0.0, sy1 - ty2)
+                edge_gap = min(g for g in [gap_x1, gap_x2, gap_y1, gap_y2] if g > 0) if any(g > 0 for g in [gap_x1, gap_x2, gap_y1, gap_y2]) else 0.0
+                if edge_gap < min_sofa_storage_gap:
+                    penalty += (min_sofa_storage_gap - edge_gap) * 120.0
+
+        # Wardrobe front corridor: keep a clear strip in front for door swing / standing space
+        corridor_depth = 70.0  # cm
+        room_w, room_h = self.room_dims
+        for wrob in wardrobes:
+            x1, y1 = wrob["x"], wrob["y"]
+            x2, y2 = x1 + wrob["w"], y1 + wrob["h"]
+            # Determine which wall this wardrobe is against
+            dist_left = x1
+            dist_right = room_w - x2
+            dist_top = y1
+            dist_bottom = room_h - y2
+            dmin = min(dist_left, dist_right, dist_top, dist_bottom)
+            if dmin == dist_bottom:
+                # Wardrobe on bottom wall -> corridor above it
+                cx1, cy1, cx2, cy2 = x1, max(0.0, y1 - corridor_depth), x2, y1
+            elif dmin == dist_top:
+                # on top wall -> corridor below
+                cx1, cy1, cx2, cy2 = x1, y2, x2, min(room_h, y2 + corridor_depth)
+            elif dmin == dist_left:
+                # on left wall -> corridor to the right
+                cx1, cy1, cx2, cy2 = x2, y1, min(room_w, x2 + corridor_depth), y2
+            else:
+                # on right wall -> corridor to the left
+                cx1, cy1, cx2, cy2 = max(0.0, x1 - corridor_depth), y1, x1, y2
+
+            def _overlap_rect(a, b) -> float:
+                ax1, ay1, ax2, ay2 = a
+                bx1, by1, bx2, by2 = b
+                ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+                ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+                if ix2 <= ix1 or iy2 <= iy1:
+                    return 0.0
+                return (ix2 - ix1) * (iy2 - iy1)
+
+            corridor = (cx1, cy1, cx2, cy2)
+            for o in layout:
+                if o is wrob:
+                    continue
+                ox1, oy1 = o["x"], o["y"]
+                ox2, oy2 = ox1 + o["w"], oy1 + o["h"]
+                if _overlap_rect(corridor, (ox1, oy1, ox2, oy2)) > 0.0:
+                    penalty += 30000.0
+
+        # Major furniture must not overlap plants/vases (decor obstacles)
+        blocking_major = sofas + beds + wardrobes + desks + generic_tables + dining_tables
+
+        # 1) Layout-level plant objects (if present in GA population)
+        for maj in blocking_major:
+            for pl in plants:
+                if self._overlap(maj, pl):
+                    # Heavy penalty to effectively forbid this configuration
+                    penalty += 40000.0
+
+        # 2) Detected plants/vases from room_analysis (most common case)
+        det_plants = []
+        for det in self.room_analysis.get("detections", []):
+            dt = _dtype(det)
+            if dt in {"plant", "potted plant"} or "plant" in dt or "vase" in dt:
+                bb = det.get("room_bbox") or det.get("bbox")
+                if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                    det_plants.append(tuple(map(float, bb)))
+
+        def _rect_overlap(a, b) -> float:
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                return 0.0
+            return (ix2 - ix1) * (iy2 - iy1)
+
+        if det_plants:
+            for maj in blocking_major:
+                mx1, my1 = maj["x"], maj["y"]
+                mx2, my2 = mx1 + maj["w"], my1 + maj["h"]
+                mrect = (mx1, my1, mx2, my2)
+                for pb in det_plants:
+                    if _rect_overlap(mrect, pb) > 0.0:
+                        penalty += 40000.0
 
         # Sofa under the fan: encourage proximity to ceiling fan if present
         fans = [o for o in layout if ("ceiling fan" in T(o) or ("fan" in T(o) and "ceiling" in T(o)))]

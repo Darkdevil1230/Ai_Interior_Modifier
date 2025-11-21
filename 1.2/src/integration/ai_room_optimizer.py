@@ -79,6 +79,7 @@ class AIRoomOptimizer:
         self.furniture_layout = []
         self.optimizer_diagnostics: List[Dict] = []
         self.last_method: str = "none"  # 'llm_constraint_solver' or 'genetic_algorithm_fallback'
+        self._allowed_kinds: List[str] = []  # strict selection keywords
     
     def analyze_room(self, image_path: str) -> Dict:
         """
@@ -521,6 +522,38 @@ class AIRoomOptimizer:
         print(f"[AI Room Optimizer] Total furniture area: {total_furniture_area:.0f}cm² ({total_furniture_area/room_area*100:.1f}% of room)")
         
         return validated_furniture
+
+    def _allowed_furniture_kinds(self, validated_furniture: List[Dict]) -> List[str]:
+        """Derive high-level furniture kind keywords from the user's selection.
+
+        This is used to enforce *strict selection mode*: the final layout will
+        only contain furniture whose type string includes one of these kinds
+        (e.g. selecting "3-Seat Sofa" allows any item whose type contains
+        "sofa" or "couch"). Architectural / fixed elements are never filtered.
+        """
+        keywords = set()
+        base_map = {
+            "sofa": ["sofa", "couch"],
+            "bed": ["bed"],
+            "wardrobe": ["wardrobe", "closet"],
+            "desk": ["desk"],
+            "table": ["table"],
+            "chair": ["chair", "stool", "ottoman", "bench", "recliner", "recliner chair"],
+            "tv": ["tv", "television", "monitor"],
+            "bookshelf": ["bookcase", "bookshelf"],
+            "nightstand": ["nightstand", "bedside table"],
+            "lamp": ["lamp", "chandelier", "sconce"],
+            "plant": ["plant", "potted plant"],
+            "mirror": ["mirror"],
+        }
+
+        for f in validated_furniture:
+            t = str(f.get("type") or f.get("name") or "").lower().replace("_", " ")
+            for base, variants in base_map.items():
+                if any(v in t for v in variants):
+                    for v in variants:
+                        keywords.add(v)
+        return sorted(keywords)
     
     def optimize_furniture_placement(self, furniture_list: List[Dict], 
                                     user_preferences: Dict = None) -> List[Dict]:
@@ -600,15 +633,32 @@ class AIRoomOptimizer:
                 self.optimizer_diagnostics = []
             self.last_method = "genetic_algorithm_fallback"
         
-        # Separate furniture from architectural elements in the optimized layout
+        # --- Strict selection mode: only keep furniture matching user choices ---
+        allowed_kinds = self._allowed_furniture_kinds(validated_furniture)
+        self._allowed_kinds = allowed_kinds
+
+        # Separate furniture from architectural elements in the optimized layout.
+        # In strict selection mode we only treat core elements as architectural;
+        # all other items must pass the allowed_kinds furniture filter.
         self.furniture_layout = []
         detected_arch_elements = []
-        
+
+        architectural_types = {"window", "door", "wall", "plant", "potted plant", "vase"}
+
         for item in combined_layout:
-            if item.get("architectural", False) or item.get("fixed", False):
+            t = str(item.get("type") or item.get("name") or "").lower().replace("_", " ")
+
+            # True architectural/fixed decor that should always be shown
+            if any(at in t for at in architectural_types):
                 detected_arch_elements.append(item)
-            else:
-                self.furniture_layout.append(item)
+                continue
+
+            # Everything else is treated as furniture and must match selection
+            if allowed_kinds and not any(k in t for k in allowed_kinds):
+                # Filter out furniture types the user did not select.
+                continue
+
+            self.furniture_layout.append(item)
         
         # Update architectural elements with newly detected ones (from fallback detector)
         if detected_arch_elements:
@@ -646,9 +696,20 @@ class AIRoomOptimizer:
         if isinstance(self.room_type, str):
             self.layout_generator.room_type = self.room_type
 
+        # In strict selection mode, hide decor plants/vases unless user selected plants
+        arch_elems = list(self.architectural_elements or [])
+        if self._allowed_kinds is not None and "plant" not in self._allowed_kinds:
+            filtered = []
+            for e in arch_elems:
+                t = str(e.get("type") or "").lower()
+                if t in {"plant", "potted plant", "vase"}:
+                    continue
+                filtered.append(e)
+            arch_elems = filtered
+
         # Generate layout
         buffer = self.layout_generator.generate_layout(
-            architectural_elements=self.architectural_elements,
+            architectural_elements=arch_elems,
             furniture_layout=self.furniture_layout,
             save_path=save_path,
             save_buffer=save_buffer,
@@ -670,12 +731,19 @@ class AIRoomOptimizer:
             return layout
         room_w, room_h = self.room_dims
         arch_bboxes = []
+        clearance = 10.0  # cm visual clearance around architectural/decor elements
         for d in self.room_analysis.get("detections", []):
             t = str(d.get("type") or d.get("label") or "").lower()
             if t in {"window", "door", "wall", "plant", "potted plant", "vase"}:
                 bb = d.get("room_bbox") or d.get("bbox")
                 if isinstance(bb, (list, tuple)) and len(bb) == 4:
-                    arch_bboxes.append(tuple(map(float, bb)))
+                    x1, y1, x2, y2 = map(float, bb)
+                    # Inflate bbox slightly so furniture keeps a small visible gap
+                    x1 = max(0.0, x1 - clearance)
+                    y1 = max(0.0, y1 - clearance)
+                    x2 = min(room_w, x2 + clearance)
+                    y2 = min(room_h, y2 + clearance)
+                    arch_bboxes.append((x1, y1, x2, y2))
 
         def rect_overlap(a, b) -> float:
             ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b

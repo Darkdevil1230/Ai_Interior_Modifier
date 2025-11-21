@@ -53,9 +53,10 @@ def enforce_constraints(room_w: float, room_h: float, detections: List[Dict[str,
         model.Add(Cy[i] >= half_h)
         model.Add(Cy[i] <= room_h_i - half_h)
 
-    # Door swing clearance (approximate) and collect window bboxes in cm
+    # Door swing clearance (approximate) and collect window/plant bboxes in cm
     door_centers: List[tuple[int, int]] = []
     window_bboxes: List[List[int]] = []
+    plant_bboxes: List[List[int]] = []
     for det in detections or []:
         t = str(det.get("type") or det.get("label") or "").lower()
         bb = det.get("room_bbox") or det.get("bbox")
@@ -68,6 +69,10 @@ def enforce_constraints(room_w: float, room_h: float, detections: List[Dict[str,
             door_centers.append((cx, cy))
         elif t == "window":
             window_bboxes.append([x1, y1, x2, y2])
+        elif t in {"plant", "potted plant"} or "plant" in t or "vase" in t:
+            # Treat detected plants/vases as fixed decor obstacles that
+            # large furniture should not overlap.
+            plant_bboxes.append([x1, y1, x2, y2])
 
     clearance = 90
     for (dx, dy) in door_centers:
@@ -150,6 +155,25 @@ def enforce_constraints(room_w: float, room_h: float, detections: List[Dict[str,
             model.Add(Cy[i] * 2 + H[i] <= 2 * wy1).OnlyEnforceIf(b3)
             model.Add(2 * wy2 <= Cy[i] * 2 - H[i]).OnlyEnforceIf(b4)
             model.AddBoolOr([b1, b2, b3, b4])
+
+    # Large furniture vs detected plants/vases: strict non-overlap
+    blocking_types = {"sofa", "couch", "bed", "wardrobe", "closet",
+                      "bookcase", "bookshelf", "desk", "table", "dining table"}
+    if plant_bboxes:
+        for i, it in enumerate(items):
+            t = str(it.get("type") or "").lower()
+            if not any(bt in t for bt in blocking_types):
+                continue
+            for (px1, py1, px2, py2) in plant_bboxes:
+                b1 = model.NewBoolVar(f"obj_left_plant_{i}_{px1}_{py1}")
+                b2 = model.NewBoolVar(f"obj_right_plant_{i}_{px1}_{py1}")
+                b3 = model.NewBoolVar(f"obj_above_plant_{i}_{px1}_{py1}")
+                b4 = model.NewBoolVar(f"obj_below_plant_{i}_{px1}_{py1}")
+                model.Add(Cx[i] * 2 + W[i] <= 2 * px1).OnlyEnforceIf(b1)
+                model.Add(2 * px2 <= Cx[i] * 2 - W[i]).OnlyEnforceIf(b2)
+                model.Add(Cy[i] * 2 + H[i] <= 2 * py1).OnlyEnforceIf(b3)
+                model.Add(2 * py2 <= Cy[i] * 2 - H[i]).OnlyEnforceIf(b4)
+                model.AddBoolOr([b1, b2, b3, b4])
 
     # Bed and wardrobe must touch at least one wall (in a relaxed sense)
     wall_margin = 5
